@@ -22,7 +22,7 @@ use std::{
 
 pub enum Event {
     Command(String),
-    Finished(Result<(String, String)>),
+    Finished(u64, Result<(String, String)>),
     Catalog(Result<Vec<String>>),
     Save(settings::Settings),
 }
@@ -34,6 +34,7 @@ struct Capture {
 pub struct App {
     phase: Phase,
     capture: Option<Capture>,
+    last_request_id: u64,
     tx: mpsc::Sender<Event>,
     client: reqwest::blocking::Client,
     key: String,
@@ -51,10 +52,19 @@ impl App {
             Phase::Error => [160, 75, 210],
         }
     }
+    fn discard_capture(&mut self) {
+        if let Some(mut capture) = self.capture.take() {
+            let _ = capture.child.kill();
+            let _ = capture.child.wait();
+            let _ = capture.reader.join();
+            let _ = capture.errors.join();
+        }
+    }
     fn start(&mut self, from_shortcut: bool) -> Result<()> {
         if !matches!(self.phase, Phase::Idle | Phase::Error) {
             return Ok(());
         }
+        self.discard_capture();
         let address = active_address()?;
         ensure!(valid_address(&address), "No hay ventana enfocada válida");
         let mut command = Command::new("pw-record");
@@ -135,9 +145,14 @@ impl App {
         Ok(())
     }
     fn stop(&mut self) -> Result<()> {
-        let Some(address) = self.phase.stop() else {
+        let request_id = self
+            .last_request_id
+            .checked_add(1)
+            .context("Límite de peticiones excedido")?;
+        let Some(address) = self.phase.stop(request_id) else {
             return Ok(());
         };
+        self.last_request_id = request_id;
         let Some(mut capture) = self.capture.take() else {
             bail!("No hay captura");
         };
@@ -224,18 +239,43 @@ impl App {
                 ensure!(text.len() <= 100_000, "Transcripción demasiado grande");
                 Ok((address, text))
             })();
-            let _ = tx.send(Event::Finished(result));
+            let _ = tx.send(Event::Finished(request_id, result));
         });
         Ok(())
     }
+    fn finish(
+        &mut self,
+        request_id: u64,
+        result: Result<(String, String)>,
+        insert: impl FnOnce(&str, &str) -> Result<()>,
+    ) -> Result<()> {
+        if self.phase != Phase::Processing(request_id) {
+            return Ok(());
+        }
+        result.and_then(|(address, text)| {
+            if !text.is_empty() {
+                insert(&address, &text)?;
+            }
+            self.phase = Phase::Idle;
+            Ok(())
+        })
+    }
+    fn report_error(&mut self, error: anyhow::Error, dictation_error: bool) {
+        eprintln!("hypr-dictate: {error}");
+        self.error = error.to_string();
+        if self.capture.is_none()
+            && (dictation_error
+                || !matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)))
+        {
+            self.phase = Phase::Error;
+        }
+    }
     pub fn event(&mut self, event: Event, ui: &mut ui::Ui) {
+        let dictation_error = matches!(&event, Event::Command(_) | Event::Finished(..));
         let result = match event {
             Event::Command(command) => match command.as_str() {
                 "reload" | "reset" => {
-                    if let Some(mut capture) = self.capture.take() {
-                        let _ = capture.child.kill();
-                        let _ = capture.child.wait();
-                    }
+                    self.discard_capture();
                     self.phase = Phase::Idle;
                     self.error.clear();
                     ui.level = 0.;
@@ -307,31 +347,22 @@ impl App {
                 ui.message = "Ajustes guardados".into();
                 Ok(())
             })(),
-            Event::Finished(result) => result.and_then(|(address, text)| {
-                if !text.is_empty() {
-                    restore(&address)?;
-                    ui.type_text(&text, &address)?;
-                }
-                self.phase = Phase::Idle;
-                Ok(())
-            }),
+            Event::Finished(request_id, result) => {
+                self.finish(request_id, result, |address, text| {
+                    restore(address)?;
+                    ui.type_text(text, address)
+                })
+            }
         };
         if let Err(error) = result {
-            eprintln!("hypr-dictate: {error}");
-            self.error = error.to_string();
+            self.report_error(error, dictation_error);
             ui.message = self.error.clone();
-            if self.capture.is_none() {
-                self.phase = Phase::Error;
-            }
         }
     }
 }
 impl Drop for App {
     fn drop(&mut self) {
-        if let Some(capture) = &mut self.capture {
-            let _ = capture.child.kill();
-            let _ = capture.child.wait();
-        }
+        self.discard_capture();
     }
 }
 fn hypr(args: &[&str]) -> Result<Vec<u8>> {
@@ -423,6 +454,7 @@ fn main() -> Result<()> {
     let app = App {
         phase: Phase::Idle,
         capture: None,
+        last_request_id: 0,
         tx,
         client: reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(25))
@@ -453,4 +485,185 @@ fn main() -> Result<()> {
         let _ = catalog_tx.send(Event::Catalog(result));
     });
     ui::run(app, rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(phase: Phase) -> App {
+        let (tx, _) = mpsc::channel();
+        App {
+            phase,
+            capture: None,
+            last_request_id: 2,
+            tx,
+            client: reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+            key: String::new(),
+            endpoint: String::new(),
+            settings: settings::Settings::default(),
+            level: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn cancelled_or_stale_results_never_insert_or_change_phase() {
+        for phase in [
+            Phase::Idle,
+            Phase::Error,
+            Phase::Recording("0xdef".into()),
+            Phase::Processing(2),
+        ] {
+            let mut app = app(phase);
+            let expected = format!("{:?}", app.phase);
+            app.finish(1, Ok(("0xabc".into(), "cancelled text".into())), |_, _| {
+                panic!("stale result must not restore focus or type text")
+            })
+            .unwrap();
+            assert_eq!(format!("{:?}", app.phase), expected);
+        }
+    }
+
+    #[test]
+    fn cancelled_or_stale_errors_are_ignored() {
+        for phase in [
+            Phase::Idle,
+            Phase::Error,
+            Phase::Recording("0xdef".into()),
+            Phase::Processing(2),
+        ] {
+            let mut app = app(phase);
+            let expected = format!("{:?}", app.phase);
+            app.finish(1, Err(anyhow::anyhow!("old request failed")), |_, _| {
+                panic!("failed request must not type text")
+            })
+            .unwrap();
+            assert_eq!(format!("{:?}", app.phase), expected);
+            assert!(app.error.is_empty());
+        }
+    }
+
+    #[test]
+    fn current_result_inserts_once_and_finishes() {
+        let mut app = app(Phase::Processing(2));
+        let mut inserted = Vec::new();
+        for _ in 0..2 {
+            app.finish(
+                2,
+                Ok(("0xdef".into(), "current text".into())),
+                |address, text| {
+                    inserted.push((address.to_owned(), text.to_owned()));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(inserted, [("0xdef".into(), "current text".into())]);
+        assert_eq!(app.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn old_completion_leaves_new_recording_stoppable_and_new_result_deliverable() {
+        let mut app = app(Phase::Processing(1));
+        app.phase = Phase::Idle;
+        assert!(app.phase.start("0xdef"));
+        app.finish(1, Ok(("0xabc".into(), "cancelled text".into())), |_, _| {
+            panic!("cancelled request must not insert during the new recording")
+        })
+        .unwrap();
+        assert_eq!(app.phase.stop(2), Some("0xdef".into()));
+        app.finish(1, Err(anyhow::anyhow!("late failure")), |_, _| {
+            panic!("old request must not insert during the new request")
+        })
+        .unwrap();
+        assert_eq!(app.phase, Phase::Processing(2));
+        app.finish(
+            2,
+            Ok(("0xdef".into(), "new text".into())),
+            |address, text| {
+                assert_eq!(address, "0xdef");
+                assert_eq!(text, "new text");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(app.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn empty_current_result_finishes_without_inserting() {
+        let mut app = app(Phase::Processing(2));
+        app.finish(2, Ok(("0xdef".into(), String::new())), |_, _| {
+            panic!("empty result must not restore focus or type text")
+        })
+        .unwrap();
+        assert_eq!(app.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn current_request_and_insertion_errors_are_reported() {
+        let mut app = app(Phase::Processing(2));
+        let error = app
+            .finish(2, Err(anyhow::anyhow!("API failed")), |_, _| Ok(()))
+            .unwrap_err();
+        app.report_error(error, true);
+        assert_eq!(app.phase, Phase::Error);
+        assert_eq!(app.error, "API failed");
+
+        app.phase = Phase::Processing(3);
+        let error = app
+            .finish(3, Ok(("0xdef".into(), "text".into())), |_, _| {
+                bail!("destination closed")
+            })
+            .unwrap_err();
+        app.report_error(error, true);
+        assert_eq!(app.phase, Phase::Error);
+        assert_eq!(app.error, "destination closed");
+    }
+
+    #[test]
+    fn unrelated_errors_preserve_recording_and_processing() {
+        for phase in [Phase::Recording("0xdef".into()), Phase::Processing(2)] {
+            for message in ["catalog failed", "Espera a terminar el dictado"] {
+                let mut app = app(match &phase {
+                    Phase::Recording(address) => Phase::Recording(address.clone()),
+                    Phase::Processing(id) => Phase::Processing(*id),
+                    _ => unreachable!(),
+                });
+                app.report_error(anyhow::anyhow!(message), false);
+                assert_eq!(app.phase, phase);
+                assert_eq!(app.error, message);
+            }
+        }
+        let mut app = app(Phase::Idle);
+        app.report_error(anyhow::anyhow!("catalog failed"), false);
+        assert_eq!(app.phase, Phase::Error);
+    }
+
+    #[test]
+    fn discarding_capture_kills_and_reaps_child() {
+        let mut app = app(Phase::Idle);
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        app.capture = Some(Capture {
+            child,
+            reader: thread::spawn(|| Ok(Vec::new())),
+            errors: thread::spawn(|| Ok(Vec::new())),
+        });
+        app.discard_capture();
+        assert!(app.capture.is_none(), "residual capture must be removed");
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            -1,
+            "capture is still alive or a zombie"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
 }

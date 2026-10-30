@@ -2,7 +2,7 @@
 pub enum Phase {
     Idle,
     Recording(String),
-    Processing(String),
+    Processing(u64),
     Error,
 }
 
@@ -14,10 +14,10 @@ impl Phase {
         *self = Self::Recording(address.into());
         true
     }
-    pub fn stop(&mut self) -> Option<String> {
+    pub fn stop(&mut self, request_id: u64) -> Option<String> {
         if let Self::Recording(address) = self {
             let address = address.clone();
-            *self = Self::Processing(address.clone());
+            *self = Self::Processing(request_id);
             Some(address)
         } else {
             None
@@ -251,9 +251,9 @@ mod tests {
         let mut phase = Phase::Idle;
         assert!(phase.start("0xabc"));
         assert!(!phase.start("0xdef"));
-        assert_eq!(phase.stop(), Some("0xabc".into()));
-        assert_eq!(phase, Phase::Processing("0xabc".into()));
-        assert_eq!(phase.stop(), None);
+        assert_eq!(phase.stop(1), Some("0xabc".into()));
+        assert_eq!(phase, Phase::Processing(1));
+        assert_eq!(phase.stop(2), None);
     }
     #[test]
     fn invalid_target_never_starts_recording() {
