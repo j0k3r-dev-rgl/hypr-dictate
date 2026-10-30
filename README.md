@@ -18,6 +18,25 @@ Los ajustes usan controles GTK4 nativos: desplegables con búsqueda, campo de UR
 
 En **General**, «Automática» muestra modelos sin prefijo. Son rutas del catálogo, no credenciales verificadas; no todos los modelos aceptan audio. No se selecciona un modelo automáticamente. Pulsa **Guardar cambios** para aplicar modelo, atajo, micrófono, pantalla y parámetros de IA. La pantalla del dock cambia al guardar, no como vista previa. Cerrar por el botón o por el gestor de ventanas descarta los cambios sin guardar. Las preferencias sin secretos se guardan en `~/.config/hypr-dictate/settings.json`.
 
+### Ajustes flotantes en Hyprland
+
+La ventana de ajustes es una ventana GTK4 normal: Hyprland puede colocarla en mosaico. Para abrirla **flotante y centrada**, añade esta regla a tu configuración Lua de Hyprland (`~/.config/hypr/hyprland.lua` o un módulo cargado desde él):
+
+```lua
+hl.window_rule({
+    name = "float-hypr-dictate-settings",
+    match = { class = "^dev[.]j0k3r[.]HyprDictate$" },
+    float = true,
+    center = true,
+})
+```
+
+Esta sintaxis se ha probado con **Hyprland 0.57 y configuración Lua**. Si usas otra versión o formato de configuración, adapta la regla a su sintaxis manteniendo la clase exacta `dev.j0k3r.HyprDictate`.
+
+Ejecuta `hyprctl reload` y cierra y vuelve a abrir los ajustes para aplicar la regla. Conserva el tamaño predeterminado de la ventana y permite moverla o redimensionarla. Solo afecta a los ajustes, no al dock Wayland.
+
+**La aplicación no instala esta regla automáticamente.** Es una preferencia local de Hyprland, independiente de `settings.json`.
+
 ### Servidor y modelo
 
 La clave se lee de `CLIPROXYAPI_API_KEY`, nunca de un archivo de configuración. La URL se configura desde la interfaz:
