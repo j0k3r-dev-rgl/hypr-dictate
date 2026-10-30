@@ -25,6 +25,7 @@ pub enum Event {
     Finished(u64, Result<(String, String)>),
     Catalog(Result<Vec<String>>),
     Save(settings::Settings),
+    SavePosition(i32),
 }
 struct Capture {
     child: Child,
@@ -243,6 +244,17 @@ impl App {
         });
         Ok(())
     }
+    fn save_position(
+        &mut self,
+        x: i32,
+        persist: impl FnOnce(&settings::Settings) -> Result<()>,
+    ) -> Result<()> {
+        let mut settings = self.settings.clone();
+        settings.x = x;
+        persist(&settings)?;
+        self.settings = settings;
+        Ok(())
+    }
     fn finish(
         &mut self,
         request_id: u64,
@@ -320,6 +332,9 @@ impl App {
                 }
                 Err(e) => Err(e),
             },
+            Event::SavePosition(x) => self.save_position(x, settings::Settings::save).map(|()| {
+                ui.position_saved(self.settings.x);
+            }),
             Event::Save(settings) => (|| -> Result<()> {
                 ensure!(
                     !matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)),
@@ -344,6 +359,7 @@ impl App {
                 }
                 settings.save()?;
                 self.settings = settings;
+                ui.settings_saved(&self.settings);
                 ui.message = "Ajustes guardados".into();
                 Ok(())
             })(),
@@ -491,7 +507,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn app(phase: Phase) -> App {
+    pub(super) fn app(phase: Phase) -> App {
         let (tx, _) = mpsc::channel();
         App {
             phase,
@@ -642,6 +658,50 @@ mod tests {
         let mut app = app(Phase::Idle);
         app.report_error(anyhow::anyhow!("catalog failed"), false);
         assert_eq!(app.phase, Phase::Error);
+    }
+
+    #[test]
+    fn position_save_preserves_every_other_setting_and_active_phase() {
+        for phase in [
+            Phase::Idle,
+            Phase::Recording("0xdef".into()),
+            Phase::Processing(2),
+        ] {
+            let mut app = app(phase);
+            app.settings = settings::Settings {
+                model: "offline/model".into(),
+                x: 123,
+                shortcut: "SUPER + F9".into(),
+                microphone: "saved-mic".into(),
+                monitor: "saved-monitor".into(),
+                temperature: 0.7,
+                prompt: "saved prompt".into(),
+            };
+            let mut expected = app.settings.clone();
+            expected.x = 456;
+            let phase = format!("{:?}", app.phase);
+            let mut calls = 0;
+            app.save_position(456, |candidate| {
+                calls += 1;
+                assert_eq!(format!("{candidate:?}"), format!("{expected:?}"));
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(format!("{:?}", app.settings), format!("{expected:?}"));
+            assert_eq!(format!("{:?}", app.phase), phase);
+        }
+    }
+
+    #[test]
+    fn failed_position_save_preserves_committed_settings() {
+        let mut app = app(Phase::Processing(2));
+        let expected = format!("{:?}", app.settings);
+        let error = app.save_position(456, |_| bail!("disk full")).unwrap_err();
+        app.report_error(error, false);
+        assert_eq!(format!("{:?}", app.settings), expected);
+        assert_eq!(app.phase, Phase::Processing(2));
+        assert_eq!(app.error, "disk full");
     }
 
     #[test]

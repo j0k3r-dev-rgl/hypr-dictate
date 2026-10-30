@@ -58,6 +58,7 @@ pub struct Ui {
     pub models: Vec<String>,
     pub message: String,
     draft: crate::settings::Settings,
+    saved: crate::settings::Settings,
     panel: bool,
     open_select: Option<usize>,
     in_modal: bool,
@@ -86,6 +87,108 @@ pub struct Ui {
     xkb_state: Option<xkb::State>,
 }
 impl Ui {
+    fn new(
+        connection: Connection,
+        app: &App,
+        microphones: Vec<crate::settings::Microphone>,
+        monitors: Vec<crate::settings::MonitorInfo>,
+        max_x: i32,
+    ) -> Self {
+        Self {
+            connection,
+            compositor: None,
+            shm: None,
+            seat: None,
+            shell: None,
+            manager: None,
+            keyboard: None,
+            surface: None,
+            layer: None,
+            modal_surface: None,
+            modal_layer: None,
+            pointer: None,
+            tx: app.tx.clone(),
+            configured: false,
+            modal_configured: false,
+            closed: false,
+            color: app.color(),
+            models: Vec::new(),
+            message: "Cargando catálogo…".into(),
+            draft: app.settings.clone(),
+            saved: app.settings.clone(),
+            panel: false,
+            open_select: None,
+            in_modal: false,
+            pointer_xy: (0., 0.),
+            press: None,
+            dragged: false,
+            tick: 0.,
+            open_progress: 0.,
+            level: 0.,
+            account_index: 0,
+            model_index: 0,
+            shortcut_index: SHORTCUTS
+                .iter()
+                .position(|s| *s == app.settings.shortcut)
+                .unwrap_or(0),
+            microphone_index: microphones
+                .iter()
+                .position(|m| m.name == app.settings.microphone)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+            microphones,
+            outputs: Vec::new(),
+            monitor_index: monitors
+                .iter()
+                .position(|m| m.name == app.settings.monitor)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+            monitors,
+            buffers: 0,
+            dirty: true,
+            max_x,
+            tab: 0,
+            prompt_cursor: app.settings.prompt.chars().count(),
+            prompt_focused: false,
+            seat_keyboard: None,
+            xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            xkb_state: None,
+        }
+    }
+    fn discard_draft(&mut self) {
+        self.draft = self.saved.clone();
+        self.sync_model_indices();
+        self.shortcut_index = SHORTCUTS
+            .iter()
+            .position(|s| *s == self.draft.shortcut)
+            .unwrap_or(0);
+        self.microphone_index = self
+            .microphones
+            .iter()
+            .position(|m| m.name == self.draft.microphone)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.monitor_index = self
+            .monitors
+            .iter()
+            .position(|m| m.name == self.draft.monitor)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.prompt_cursor = self.draft.prompt.chars().count();
+        self.open_select = None;
+        self.prompt_focused = false;
+        self.dirty = true;
+    }
+    pub fn settings_saved(&mut self, settings: &crate::settings::Settings) {
+        self.saved = settings.clone();
+    }
+    pub fn position_saved(&mut self, x: i32) {
+        self.saved.x = x;
+        self.draft.x = x;
+    }
+    fn save_position(&self) {
+        let _ = self.tx.send(Event::SavePosition(self.draft.x));
+    }
     fn attach(
         &mut self,
         surface: &wl_surface::WlSurface,
@@ -185,6 +288,14 @@ impl Ui {
     }
     fn toggle_modal(&mut self, qh: &QueueHandle<Self>) {
         if self.panel {
+            let restore_dock = self.draft.monitor != self.saved.monitor;
+            self.discard_draft();
+            if restore_dock {
+                self.setup_dock(qh);
+            } else if let (Some(layer), Some(surface)) = (&self.layer, &self.surface) {
+                layer.set_margin(0, 0, 0, self.draft.x);
+                surface.commit();
+            }
             self.panel = false;
             self.open_select = None;
             self.prompt_focused = false;
@@ -196,6 +307,7 @@ impl Ui {
             }
             self.modal_configured = false;
         } else {
+            self.discard_draft();
             self.panel = true;
             self.tab = 0;
             self.prompt_cursor = self.draft.prompt.chars().count();
@@ -217,7 +329,7 @@ impl Ui {
         }
         self.dirty = true;
     }
-    pub fn catalog_loaded(&mut self) {
+    fn sync_model_indices(&mut self) {
         let account = self
             .draft
             .model
@@ -234,6 +346,9 @@ impl Ui {
             .iter()
             .position(|m| m == &self.draft.model)
             .unwrap_or(0);
+    }
+    pub fn catalog_loaded(&mut self) {
+        self.sync_model_indices();
         self.dirty = true;
         self.message = format!(
             "{} rutas disponibles · elige cuenta, modelo, atajo, micro y pantalla",
@@ -881,7 +996,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Ui {
                 if state.in_modal {
                     state.modal_click(qh);
                 } else if state.dragged {
-                    let _ = state.tx.send(Event::Save(state.draft.clone()));
+                    state.save_position();
                 } else {
                     let _ = state.tx.send(Event::Command("toggle".into()));
                 }
@@ -984,65 +1099,13 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
     // and never blocks startup if PipeWire's CLI tooling has an issue.
     let microphones = crate::settings::microphones().unwrap_or_default();
     let monitors = crate::settings::monitors();
-    let mut ui = Ui {
-        connection: connection.clone(),
-        compositor: None,
-        shm: None,
-        seat: None,
-        shell: None,
-        manager: None,
-        keyboard: None,
-        surface: None,
-        layer: None,
-        modal_surface: None,
-        modal_layer: None,
-        pointer: None,
-        tx: app.tx.clone(),
-        configured: false,
-        modal_configured: false,
-        closed: false,
-        color: app.color(),
-        models: Vec::new(),
-        message: "Cargando catálogo…".into(),
-        draft: app.settings.clone(),
-        panel: false,
-        open_select: None,
-        in_modal: false,
-        pointer_xy: (0., 0.),
-        press: None,
-        dragged: false,
-        tick: 0.,
-        open_progress: 0.,
-        level: 0.,
-        account_index: 0,
-        model_index: 0,
-        shortcut_index: SHORTCUTS
-            .iter()
-            .position(|s| *s == app.settings.shortcut)
-            .unwrap_or(0),
-        microphones: microphones.clone(),
-        microphone_index: microphones
-            .iter()
-            .position(|m| m.name == app.settings.microphone)
-            .map(|i| i + 1)
-            .unwrap_or(0),
-        monitors: monitors.clone(),
-        outputs: Vec::new(),
-        monitor_index: monitors
-            .iter()
-            .position(|m| m.name == app.settings.monitor)
-            .map(|i| i + 1)
-            .unwrap_or(0),
-        buffers: 0,
-        dirty: true,
-        max_x: monitor_width().unwrap_or(1280).saturating_sub(176),
-        tab: 0,
-        prompt_cursor: app.settings.prompt.chars().count(),
-        prompt_focused: false,
-        seat_keyboard: None,
-        xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
-        xkb_state: None,
-    };
+    let mut ui = Ui::new(
+        connection.clone(),
+        &app,
+        microphones,
+        monitors,
+        monitor_width().unwrap_or(1280).saturating_sub(176),
+    );
     connection.display().get_registry(&qh, ());
     queue.roundtrip(&mut ui)?;
     queue.roundtrip(&mut ui)?;
@@ -1123,4 +1186,152 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{Microphone, MonitorInfo};
+
+    fn ui() -> (Ui, std::os::unix::net::UnixStream) {
+        let (socket, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(socket).unwrap();
+        let mut app = crate::tests::app(hypr_dictate::Phase::Idle);
+        app.settings = crate::settings::Settings {
+            model: "account/model".into(),
+            shortcut: "SUPER + F9".into(),
+            microphone: "saved-mic".into(),
+            monitor: "saved-monitor".into(),
+            ..Default::default()
+        };
+        let mut ui = Ui::new(
+            connection,
+            &app,
+            vec![Microphone {
+                name: "saved-mic".into(),
+                description: "Mic".into(),
+            }],
+            vec![MonitorInfo {
+                name: "saved-monitor".into(),
+                description: "Monitor".into(),
+                width: 1920,
+                focused: true,
+            }],
+            1744,
+        );
+        ui.models = vec!["account/model".into()];
+        (ui, server)
+    }
+
+    #[test]
+    fn discarded_draft_restores_all_settings_and_selector_indices() {
+        let (mut ui, _server) = ui();
+        let expected = format!("{:?}", ui.saved);
+        ui.draft = crate::settings::Settings {
+            model: "other/model".into(),
+            x: 1,
+            shortcut: "CTRL + ALT + D".into(),
+            microphone: "other-mic".into(),
+            monitor: "other-monitor".into(),
+            prompt: "unsaved prompt".into(),
+            temperature: 0.9,
+        };
+        ui.account_index = 99;
+        ui.model_index = 99;
+        ui.shortcut_index = 99;
+        ui.microphone_index = 99;
+        ui.monitor_index = 99;
+        ui.prompt_cursor = 9999;
+        ui.open_select = Some(2);
+        ui.prompt_focused = true;
+        ui.discard_draft();
+        assert_eq!(format!("{:?}", ui.draft), expected);
+        assert_eq!(ui.account_index, 1);
+        assert_eq!(ui.model_index, 0);
+        assert_eq!(ui.shortcut_index, 4);
+        assert_eq!(ui.microphone_index, 1);
+        assert_eq!(ui.monitor_index, 1);
+        assert_eq!(ui.prompt_cursor, ui.saved.prompt.chars().count());
+        assert_eq!(ui.open_select, None);
+        assert!(!ui.prompt_focused);
+    }
+
+    #[test]
+    fn closing_modal_discards_edits_without_emitting_a_save() {
+        let (mut ui, _server) = ui();
+        let (tx, rx) = mpsc::channel();
+        ui.tx = tx;
+        ui.panel = true;
+        ui.draft.prompt = "unsaved prompt".into();
+        ui.draft.shortcut = "CTRL + ALT + D".into();
+        let queue = ui.connection.new_event_queue::<Ui>();
+        ui.toggle_modal(&queue.handle());
+        assert!(!ui.panel);
+        assert_eq!(format!("{:?}", ui.draft), format!("{:?}", ui.saved));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn every_close_button_discards_without_saving() {
+        for (tab, pointer_xy) in [(0, (460., 20.)), (0, (230., 420.)), (1, (350., 420.))] {
+            let (mut ui, _server) = ui();
+            let (tx, rx) = mpsc::channel();
+            ui.tx = tx;
+            ui.panel = true;
+            ui.tab = tab;
+            ui.pointer_xy = pointer_xy;
+            ui.draft.prompt = "unsaved prompt".into();
+            ui.draft.shortcut = "CTRL + ALT + D".into();
+            let queue = ui.connection.new_event_queue::<Ui>();
+            ui.modal_click(&queue.handle());
+            assert!(!ui.panel);
+            assert_eq!(format!("{:?}", ui.draft), format!("{:?}", ui.saved));
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+    }
+
+    #[test]
+    fn dragging_emits_only_position_even_without_catalog() {
+        let (mut ui, _server) = ui();
+        let (tx, rx) = mpsc::channel();
+        ui.tx = tx;
+        ui.models.clear();
+        ui.draft.x = 456;
+        ui.draft.shortcut = "CTRL + ALT + D".into();
+        ui.draft.model = "unsaved/model".into();
+        ui.draft.prompt = "unsaved prompt".into();
+        let draft = format!("{:?}", ui.draft);
+        ui.save_position();
+        assert!(matches!(rx.try_recv().unwrap(), Event::SavePosition(456)));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(format!("{:?}", ui.draft), draft);
+    }
+
+    #[test]
+    fn saved_position_survives_discard_without_committing_other_edits() {
+        let (mut ui, _server) = ui();
+        let original_shortcut = ui.saved.shortcut.clone();
+        ui.draft.shortcut = "CTRL + ALT + D".into();
+        ui.position_saved(456);
+        assert_eq!(ui.draft.shortcut, "CTRL + ALT + D");
+        assert_eq!(ui.saved.shortcut, original_shortcut);
+        ui.models.clear();
+        ui.discard_draft();
+        assert_eq!(ui.draft.x, 456);
+        assert_eq!(ui.draft.shortcut, original_shortcut);
+        assert_eq!(ui.account_index, 0);
+        assert_eq!(ui.model_index, 0);
+    }
+
+    #[test]
+    fn discard_uses_latest_successful_save_not_startup_settings() {
+        let (mut ui, _server) = ui();
+        let mut saved = ui.saved.clone();
+        saved.prompt = "new saved prompt".into();
+        saved.temperature = 0.6;
+        ui.settings_saved(&saved);
+        ui.draft.prompt = "later unsaved prompt".into();
+        ui.discard_draft();
+        assert_eq!(format!("{:?}", ui.draft), format!("{saved:?}"));
+    }
 }
