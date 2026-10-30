@@ -58,7 +58,8 @@ Suelta la tecla principal antes que los modificadores para que coincida el bindi
 - No guarda audio ni texto. Un fallo de API o de inserción descarta el resultado; una interrupción durante la escritura puede dejar texto parcial, sin reintento para evitar duplicados.
 - Con una URL base HTTP (incluido el valor predeterminado), clave y audio no están cifrados en tránsito: usa solo una red de confianza. Para cifrar el transporte, configura una URL HTTPS con un certificado válido; la validación TLS permanece activa y no se siguen redirecciones.
 - Usa un socket local con permisos 0600 en `$XDG_RUNTIME_DIR/hypr-dictate.sock`. Si el proceso termina abruptamente puede quedar un socket residual. Elimínalo manualmente únicamente después de comprobar que no queda otra instancia.
-- Los píxeles y los keymaps del teclado virtual usan archivos temporales sin nombre creados con `tempfile`, no `memfd`. Pueden pasar por disco según el directorio temporal del sistema (`$TMPDIR`, normalmente `/tmp`) y su sistema de archivos. Los archivos de píxeles no contienen audio, clave ni transcripciones; los keymaps sí contienen caracteres del texto, ordenados por primera aparición en cada bloque de hasta 10 caracteres distintos. La secuencia de bloques revela parte del orden de la transcripción. El sistema también puede usar swap: no se garantiza borrado seguro.
+- El dibujo usa un `memfd` y un pool de dos buffers por superficie. Solo reutiliza un buffer cuando el compositor lo libera; si ambos están ocupados, espera sin sobrescribirlos. El modal se repinta al cambiar su estado o el color del dictado, no por cada frame de animación del dock.
+- Los píxeles y los keymaps del teclado virtual usan `memfd`, sin archivos en `$TMPDIR`. Los buffers de píxeles no contienen audio, clave ni transcripciones; los keymaps sí contienen caracteres del texto, ordenados por primera aparición en cada bloque de hasta 10 caracteres distintos. La secuencia de bloques revela parte del orden de la transcripción. El sistema puede usar swap: no se garantiza borrado seguro de memoria.
 
 ## Validar
 
@@ -77,5 +78,6 @@ Prueba manual pendiente en la sesión gráfica:
 5. Cierra la ventana original durante otra petición: debe mostrar error y no escribir en la ventana alternativa.
 6. En **Servidor**, edita y guarda una URL válida: debe recargar el catálogo sin reiniciar. Cierra y abre el modal para comprobar que se conserva. Edita otra URL y cierra sin guardar: debe conservar la anterior.
 7. Con el servidor inaccesible, vuelve a **Servidor** y corrige la URL. El guardado no debe depender del catálogo anterior; una URL inválida debe mostrar un error sin aplicarse.
+8. Abre y cierra el modal varias veces mientras grabas o procesas: el dock debe seguir animándose, sin parpadeos ni bloqueos. Edita un campo y comprueba que el modal se actualiza. Cambia la pantalla del dock y descarta la vista previa para comprobar la recreación de sus buffers.
 
 Las pruebas automáticas verifican estados, validación del destino y cabecera WAV; no sustituyen estas comprobaciones de audio, API y teclado virtual.

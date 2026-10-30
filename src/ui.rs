@@ -2,8 +2,12 @@ use crate::{App, Event, paint::Modal};
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::BTreeMap,
+    fs::File,
     io::{Seek, SeekFrom, Write},
-    os::fd::AsFd,
+    os::{
+        fd::{AsFd, FromRawFd},
+        unix::fs::FileExt,
+    },
     sync::mpsc,
     time::Duration,
 };
@@ -36,6 +40,88 @@ const SHORTCUTS: [&str; 6] = [
     "SUPER + F9",
     "SUPER + F10",
 ];
+
+fn memory_file() -> Result<File> {
+    let fd = unsafe { libc::memfd_create(c"hypr-dictate".as_ptr(), libc::MFD_CLOEXEC) };
+    ensure!(
+        fd >= 0,
+        "No se pudo crear memfd: {}",
+        std::io::Error::last_os_error()
+    );
+    // memfd_create returned a fresh descriptor; File takes sole ownership.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+struct SurfaceBuffers {
+    file: File,
+    pool: wl_shm_pool::WlShmPool,
+    buffers: [wl_buffer::WlBuffer; 2],
+    busy: [bool; 2],
+    width: i32,
+    height: i32,
+    frame_size: usize,
+}
+impl SurfaceBuffers {
+    fn new(shm: &wl_shm::WlShm, width: i32, height: i32, qh: &QueueHandle<Ui>) -> Result<Self> {
+        let frame_size = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|size| size.checked_mul(4))
+            .filter(|size| width > 0 && height > 0 && *size <= i32::MAX as usize / 2)
+            .context("Tamaño de superficie inválido")?;
+        let file = memory_file()?;
+        file.set_len((frame_size * 2) as u64)?;
+        let pool = shm.create_pool(file.as_fd(), (frame_size * 2) as i32, qh, ());
+        let buffers = std::array::from_fn(|slot| {
+            pool.create_buffer(
+                (slot * frame_size) as i32,
+                width,
+                height,
+                width * 4,
+                wl_shm::Format::Argb8888,
+                qh,
+                (),
+            )
+        });
+        Ok(Self {
+            file,
+            pool,
+            buffers,
+            busy: [false; 2],
+            width,
+            height,
+            frame_size,
+        })
+    }
+    fn available(&self) -> bool {
+        self.busy.contains(&false)
+    }
+    fn attach(&mut self, surface: &wl_surface::WlSurface, pixels: &[u8]) -> Result<bool> {
+        ensure!(pixels.len() == self.frame_size, "Tamaño de frame inválido");
+        let Some(slot) = self.busy.iter().position(|busy| !busy) else {
+            return Ok(false);
+        };
+        self.file
+            .write_all_at(pixels, (slot * self.frame_size) as u64)?;
+        self.busy[slot] = true;
+        surface.attach(Some(&self.buffers[slot]), 0, 0);
+        surface.damage_buffer(0, 0, self.width, self.height);
+        surface.commit();
+        Ok(true)
+    }
+    fn release(&mut self, buffer: &wl_buffer::WlBuffer) {
+        if let Some(slot) = self.buffers.iter().position(|item| item == buffer) {
+            self.busy[slot] = false;
+        }
+    }
+}
+impl Drop for SurfaceBuffers {
+    fn drop(&mut self) {
+        for buffer in &self.buffers {
+            buffer.destroy();
+        }
+        self.pool.destroy();
+    }
+}
 
 pub struct Ui {
     connection: Connection,
@@ -76,7 +162,9 @@ pub struct Ui {
     pub monitors: Vec<crate::settings::MonitorInfo>,
     outputs: Vec<OutputItem>,
     monitor_index: usize,
-    buffers: usize,
+    dock_buffers: Option<SurfaceBuffers>,
+    modal_buffers: Option<SurfaceBuffers>,
+    dock_dirty: bool,
     pub dirty: bool,
     max_x: i32,
     pub tab: usize,
@@ -146,7 +234,9 @@ impl Ui {
                 .map(|i| i + 1)
                 .unwrap_or(0),
             monitors,
-            buffers: 0,
+            dock_buffers: None,
+            modal_buffers: None,
+            dock_dirty: true,
             dirty: true,
             max_x,
             tab: 0,
@@ -229,43 +319,38 @@ impl Ui {
     fn save_position(&self) {
         let _ = self.tx.send(Event::SavePosition(self.draft.x));
     }
-    fn attach(
-        &mut self,
-        surface: &wl_surface::WlSurface,
-        width: i32,
-        height: i32,
-        pixels: &[u8],
-        qh: &QueueHandle<Self>,
-    ) -> Result<()> {
-        let mut file = tempfile::tempfile()?;
-        file.write_all(pixels)?;
-        let pool =
-            self.shm
-                .as_ref()
-                .unwrap()
-                .create_pool(file.as_fd(), pixels.len() as i32, qh, ());
-        let buffer = pool.create_buffer(
-            0,
-            width,
-            height,
-            width * 4,
-            wl_shm::Format::Argb8888,
-            qh,
-            (),
-        );
-        self.buffers += 1;
-        surface.attach(Some(&buffer), 0, 0);
-        surface.damage_buffer(0, 0, width, height);
-        surface.commit();
-        pool.destroy();
-        Ok(())
+    fn animate_dock(&mut self, color: [u8; 3]) {
+        if self.color != color {
+            self.dirty = true;
+            self.color = color;
+        }
+        self.tick += 1.;
+        self.dock_dirty = true;
     }
     fn draw(&mut self, qh: &QueueHandle<Self>) -> Result<()> {
-        if self.buffers >= 4 {
-            return Ok(());
+        if self.configured && self.dock_buffers.is_none() {
+            self.dock_buffers = Some(SurfaceBuffers::new(
+                self.shm.as_ref().unwrap(),
+                176,
+                44,
+                qh,
+            )?);
         }
-        self.dirty = false;
-        if self.configured {
+        if self.panel && self.modal_configured && self.modal_buffers.is_none() {
+            self.modal_buffers = Some(SurfaceBuffers::new(
+                self.shm.as_ref().unwrap(),
+                540,
+                crate::paint::MODAL_HEIGHT,
+                qh,
+            )?);
+        }
+        if self.configured
+            && self.dock_dirty
+            && self
+                .dock_buffers
+                .as_ref()
+                .is_some_and(SurfaceBuffers::available)
+        {
             let pixels = crate::paint::shell(
                 176,
                 44,
@@ -274,10 +359,23 @@ impl Ui {
                 self.level,
                 self.tick,
             )?;
-            let surface = self.surface.as_ref().unwrap().clone();
-            self.attach(&surface, 176, 44, &pixels, qh)?;
+            if self
+                .dock_buffers
+                .as_mut()
+                .unwrap()
+                .attach(self.surface.as_ref().unwrap(), &pixels)?
+            {
+                self.dock_dirty = false;
+            }
         }
-        if self.panel && self.modal_configured {
+        if self.panel
+            && self.modal_configured
+            && self.dirty
+            && self
+                .modal_buffers
+                .as_ref()
+                .is_some_and(SurfaceBuffers::available)
+        {
             let accounts = self.accounts();
             let account = &accounts[self.account_index.min(accounts.len() - 1)];
             let shortcut_labels: Vec<String> = SHORTCUTS
@@ -324,8 +422,17 @@ impl Ui {
                     server_focused: self.server_focused,
                 },
             )?;
-            let surface = self.modal_surface.as_ref().unwrap().clone();
-            self.attach(&surface, 540, crate::paint::MODAL_HEIGHT, &pixels, qh)?;
+            if self
+                .modal_buffers
+                .as_mut()
+                .unwrap()
+                .attach(self.modal_surface.as_ref().unwrap(), &pixels)?
+            {
+                self.dirty = false;
+            }
+        }
+        if !self.panel {
+            self.dirty = false;
         }
         Ok(())
     }
@@ -349,6 +456,7 @@ impl Ui {
                 surface.destroy();
             }
             self.modal_configured = false;
+            self.modal_buffers = None;
         } else {
             self.discard_draft();
             self.panel = true;
@@ -473,6 +581,8 @@ impl Ui {
         self.max_x = width.saturating_sub(176);
     }
     fn setup_dock(&mut self, qh: &QueueHandle<Self>) {
+        self.dock_buffers = None;
+        self.dock_dirty = true;
         if let Some(layer) = self.layer.take() {
             layer.destroy();
         }
@@ -737,7 +847,7 @@ impl Ui {
             let keymap = format!(
                 "xkb_keymap {{ xkb_keycodes \"dictate\" {{ minimum = 8; maximum = 255; {names} }}; xkb_types \"dictate\" {{ type \"ONE_LEVEL\" {{ modifiers = None; level_name[Level1] = \"Any\"; }}; }}; xkb_compatibility \"dictate\" {{}}; xkb_symbols \"dictate\" {{ {symbols} }}; }};\0"
             );
-            let mut file = tempfile::tempfile()?;
+            let mut file = memory_file()?;
             file.write_all(keymap.as_bytes())?;
             file.seek(SeekFrom::Start(0))?;
             keyboard.keymap(1, file.as_fd(), keymap.len() as u32);
@@ -1106,6 +1216,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for Ui {
                     state.modal_configured = true;
                 } else {
                     state.configured = true;
+                    state.dock_dirty = true;
                 }
                 state.dirty = true;
                 if let Err(error) = state.draw(qh) {
@@ -1134,8 +1245,12 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for Ui {
         _: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event {
-            state.buffers = state.buffers.saturating_sub(1);
-            buffer.destroy();
+            if let Some(buffers) = &mut state.dock_buffers {
+                buffers.release(buffer);
+            }
+            if let Some(buffers) = &mut state.modal_buffers {
+                buffers.release(buffer);
+            }
         }
     }
 }
@@ -1223,7 +1338,7 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
                     -0.1
                 })
             .clamp(0., 1.);
-            ui.dirty = true;
+            ui.dock_dirty = true;
         }
         let animating = active || ui.open_progress > 0.01;
         if matches!(app.phase, hypr_dictate::Phase::Processing(_)) {
@@ -1240,9 +1355,10 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
                 ui.level = (ui.level * 0.86 - 0.008).max(0.);
             }
         }
-        if (animating || color != ui.color || ui.dirty) && ui.configured {
-            ui.tick += 1.;
-            ui.color = color;
+        if animating || color != ui.color {
+            ui.animate_dock(color);
+        }
+        if (ui.dock_dirty || ui.dirty) && ui.configured {
             ui.draw(&qh)?;
         }
         connection.flush()?;
@@ -1271,6 +1387,7 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::settings::{Microphone, MonitorInfo};
+    use wayland_client::Proxy;
 
     fn ui() -> (Ui, std::os::unix::net::UnixStream) {
         let (socket, server) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1300,6 +1417,158 @@ mod tests {
         );
         ui.models = vec!["account/model".into()];
         (ui, server)
+    }
+
+    fn shm_and_surface(ui: &Ui) -> (wl_shm::WlShm, wl_surface::WlSurface, QueueHandle<Ui>) {
+        let queue = ui.connection.new_event_queue::<Ui>();
+        let qh = queue.handle();
+        let registry = ui.connection.display().get_registry(&qh, ());
+        let shm = registry.bind::<wl_shm::WlShm, _, _>(1, 1, &qh, ());
+        let compositor = registry.bind::<wl_compositor::WlCompositor, _, _>(2, 4, &qh, ());
+        (shm, compositor.create_surface(&qh, ()), qh)
+    }
+
+    #[test]
+    fn shared_files_are_memory_backed_and_close_on_exec() {
+        use std::os::fd::AsRawFd;
+        let file = memory_file().unwrap();
+        let target = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
+        assert!(
+            target.to_string_lossy().starts_with("/memfd:"),
+            "{target:?}"
+        );
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn surface_reuses_only_released_buffers_and_never_overwrites_busy_pixels() {
+        let (ui, _server) = ui();
+        let (shm, surface, qh) = shm_and_surface(&ui);
+        let mut buffers = SurfaceBuffers::new(&shm, 2, 2, &qh).unwrap();
+        let ids = buffers.buffers.each_ref().map(|buffer| buffer.id());
+        assert!(buffers.attach(&surface, &[1; 16]).unwrap());
+        assert!(buffers.attach(&surface, &[2; 16]).unwrap());
+        assert!(!buffers.available());
+        assert!(!buffers.attach(&surface, &[3; 16]).unwrap());
+        let mut pixels = [0; 32];
+        buffers.file.read_exact_at(&mut pixels, 0).unwrap();
+        assert_eq!(&pixels[..16], &[1; 16]);
+        assert_eq!(&pixels[16..], &[2; 16]);
+        let first = buffers.buffers[0].clone();
+        buffers.release(&first);
+        assert!(buffers.available());
+        assert!(buffers.attach(&surface, &[3; 16]).unwrap());
+        buffers.file.read_exact_at(&mut pixels, 0).unwrap();
+        assert_eq!(&pixels[..16], &[3; 16]);
+        assert_eq!(&pixels[16..], &[2; 16]);
+        assert_eq!(buffers.buffers.each_ref().map(|buffer| buffer.id()), ids);
+        assert_eq!(buffers.file.metadata().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn unchanged_modal_reuses_its_frame_while_dock_animates() {
+        let (mut ui, _server) = ui();
+        let (shm, dock, qh) = shm_and_surface(&ui);
+        let (_, modal, _) = shm_and_surface(&ui);
+        ui.shm = Some(shm);
+        ui.surface = Some(dock);
+        ui.modal_surface = Some(modal);
+        ui.configured = true;
+        ui.modal_configured = true;
+        ui.panel = true;
+        ui.draw(&qh).unwrap();
+        let modal_ids = ui
+            .modal_buffers
+            .as_ref()
+            .unwrap()
+            .buffers
+            .each_ref()
+            .map(|b| b.id());
+        let color = ui.color;
+        for _ in 0..60 {
+            let buffer = ui.dock_buffers.as_ref().unwrap().buffers[0].clone();
+            let connection = ui.connection.clone();
+            <Ui as Dispatch<wl_buffer::WlBuffer, ()>>::event(
+                &mut ui,
+                &buffer,
+                wl_buffer::Event::Release,
+                &(),
+                &connection,
+                &qh,
+            );
+            ui.animate_dock(color);
+            ui.draw(&qh).unwrap();
+            assert!(!ui.dirty);
+            assert!(!ui.dock_dirty);
+            let modal = ui.modal_buffers.as_ref().unwrap();
+            assert_eq!(modal.busy, [true, false]);
+            assert_eq!(modal.buffers.each_ref().map(|b| b.id()), modal_ids);
+        }
+    }
+
+    #[test]
+    fn modal_update_waits_for_release_without_losing_dirty_state() {
+        let (mut ui, _server) = ui();
+        let (shm, modal, qh) = shm_and_surface(&ui);
+        ui.shm = Some(shm);
+        ui.modal_surface = Some(modal);
+        ui.panel = true;
+        ui.modal_configured = true;
+        ui.draw(&qh).unwrap();
+        ui.message = "updated".into();
+        ui.dirty = true;
+        ui.draw(&qh).unwrap();
+        ui.message = "latest update".into();
+        ui.dirty = true;
+        ui.draw(&qh).unwrap();
+        assert!(ui.dirty);
+        let first = ui.modal_buffers.as_ref().unwrap().buffers[0].clone();
+        let connection = ui.connection.clone();
+        <Ui as Dispatch<wl_buffer::WlBuffer, ()>>::event(
+            &mut ui,
+            &first,
+            wl_buffer::Event::Release,
+            &(),
+            &connection,
+            &qh,
+        );
+        ui.draw(&qh).unwrap();
+        assert!(!ui.dirty);
+        assert_eq!(ui.modal_buffers.as_ref().unwrap().busy, [true, true]);
+    }
+
+    #[test]
+    fn invalid_frames_and_old_releases_cannot_corrupt_a_pool() {
+        let (ui, _server) = ui();
+        let (shm, surface, qh) = shm_and_surface(&ui);
+        assert!(SurfaceBuffers::new(&shm, 0, 2, &qh).is_err());
+        assert!(SurfaceBuffers::new(&shm, i32::MAX, 2, &qh).is_err());
+        let old = SurfaceBuffers::new(&shm, 2, 2, &qh).unwrap();
+        let old_buffer = old.buffers[0].clone();
+        let mut new = SurfaceBuffers::new(&shm, 2, 2, &qh).unwrap();
+        new.attach(&surface, &[7; 16]).unwrap();
+        assert!(new.attach(&surface, &[0; 15]).is_err());
+        new.release(&old_buffer);
+        assert_eq!(new.busy, [true, false]);
+        let mut pixels = [0; 16];
+        new.file.read_exact_at(&mut pixels, 0).unwrap();
+        assert_eq!(pixels, [7; 16]);
+    }
+
+    #[test]
+    fn dock_animation_does_not_invalidate_unchanged_modal() {
+        let (mut ui, _server) = ui();
+        ui.dirty = false;
+        ui.dock_dirty = false;
+        let color = ui.color;
+        for _ in 0..60 {
+            ui.animate_dock(color);
+            assert!(!ui.dirty, "dock tick must not invalidate the modal");
+            assert!(ui.dock_dirty);
+        }
+        ui.animate_dock([235, 65, 75]);
+        assert!(ui.dirty, "phase color change must update modal styling");
     }
 
     #[test]
