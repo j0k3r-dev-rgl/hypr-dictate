@@ -16,7 +16,19 @@ El caparazón oscuro aparece muy bajo y pegado al borde inferior. Al grabar se e
 
 En el modal centrado, cada campo (cuenta/ruta, modelo y atajo) funciona como un selector desplegable: haz clic para abrir la lista y elegir una opción, o usa la rueda para recorrerla. «Automática» muestra modelos sin prefijo. Son rutas del catálogo, no credenciales verificadas; no todos los modelos aceptan audio. Pulsa **Guardar cambios** para aplicarlos. Las preferencias sin secretos se guardan en `~/.config/hypr-dictate/settings.json`.
 
-Endpoint: `http://192.168.0.100:8317/v1/chat/completions`. Modelo: `cic/gemini-3.5-flash-lite`. La clave se lee de `CLIPROXYAPI_API_KEY`, nunca de un archivo de configuración.
+### Servidor y modelo
+
+La clave se lee de `CLIPROXYAPI_API_KEY`, nunca de un archivo de configuración. La URL se configura desde la interfaz:
+
+1. Abre el modal con clic derecho y entra en **Servidor**.
+2. Edita la URL base de CLIProxyAPI; por defecto es **`http://127.0.0.1:8317`**.
+3. Pulsa **Guardar servidor**. Se guarda en `settings.json` y se recarga el catálogo sin reiniciar, aunque el servidor anterior esté caído. No aplica otros cambios pendientes del modal. Cerrar sin guardar descarta la edición.
+
+Se añaden `/v1/chat/completions` para transcribir y `/v1/models?client_version=1` para el catálogo. La base admite HTTP o HTTPS, una barra final opcional y un prefijo de ruta (por ejemplo, `https://proxy.example.com/cliproxy`); no incluyas `/v1`, credenciales, parámetros ni fragmentos. Una URL vacía o inválida no se guarda. No se usa una variable de entorno para la dirección.
+
+Los ajustes anteriores sin `base_url` usan localhost. Una URL ya guardada se conserva. No se puede cambiar el servidor mientras se graba o procesa un dictado.
+
+Si no hay un modelo guardado, abre el modal, selecciona uno del catálogo que acepte audio y pulsa **Guardar cambios** antes de grabar. No se elige automáticamente una ruta ni una cuenta. Los modelos ya guardados se conservan.
 
 ## Atajo de mantener para hablar
 
@@ -44,7 +56,7 @@ Suelta la tecla principal antes que los modificadores para que coincida el bindi
 - Una sola grabación activa. Cancelar durante «Procesando» descarta el resultado y permite comenzar otra grabación, pero la petición HTTP anterior puede seguir en curso hasta terminar o agotar su timeout.
 - La inserción usa bloques de hasta 10 caracteres Unicode distintos, sin un límite global de 240. La respuesta está limitada a 2 MB y la transcripción a 100 000 bytes UTF-8. Respuestas truncadas o inválidas no se insertan.
 - No guarda audio ni texto. Un fallo de API o de inserción descarta el resultado; una interrupción durante la escritura puede dejar texto parcial, sin reintento para evitar duplicados.
-- La API usa HTTP en la LAN: clave y audio no están cifrados en tránsito. Usa solo una red de confianza.
+- Con una URL base HTTP (incluido el valor predeterminado), clave y audio no están cifrados en tránsito: usa solo una red de confianza. Para cifrar el transporte, configura una URL HTTPS con un certificado válido; la validación TLS permanece activa y no se siguen redirecciones.
 - Usa un socket local con permisos 0600 en `$XDG_RUNTIME_DIR/hypr-dictate.sock`. Si el proceso termina abruptamente puede quedar un socket residual. Elimínalo manualmente únicamente después de comprobar que no queda otra instancia.
 - Los píxeles y los keymaps del teclado virtual usan archivos temporales sin nombre creados con `tempfile`, no `memfd`. Pueden pasar por disco según el directorio temporal del sistema (`$TMPDIR`, normalmente `/tmp`) y su sistema de archivos. Los archivos de píxeles no contienen audio, clave ni transcripciones; los keymaps sí contienen caracteres del texto, ordenados por primera aparición en cada bloque de hasta 10 caracteres distintos. La secuencia de bloques revela parte del orden de la transcripción. El sistema también puede usar swap: no se garantiza borrado seguro.
 
@@ -63,5 +75,7 @@ Prueba manual pendiente en la sesión gráfica:
 3. Cambia a otra ventana mientras procesa: debe volver al editor e insertar allí.
 4. Comprueba el atajo de pulsar/soltar y que no roba el foco al empezar.
 5. Cierra la ventana original durante otra petición: debe mostrar error y no escribir en la ventana alternativa.
+6. En **Servidor**, edita y guarda una URL válida: debe recargar el catálogo sin reiniciar. Cierra y abre el modal para comprobar que se conserva. Edita otra URL y cierra sin guardar: debe conservar la anterior.
+7. Con el servidor inaccesible, vuelve a **Servidor** y corrige la URL. El guardado no debe depender del catálogo anterior; una URL inválida debe mostrar un error sin aplicarse.
 
 Las pruebas automáticas verifican estados, validación del destino y cabecera WAV; no sustituyen estas comprobaciones de audio, API y teclado virtual.

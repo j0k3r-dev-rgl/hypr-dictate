@@ -82,6 +82,8 @@ pub struct Ui {
     pub tab: usize,
     pub prompt_cursor: usize,
     pub prompt_focused: bool,
+    server_cursor: usize,
+    server_focused: bool,
     seat_keyboard: Option<wl_keyboard::WlKeyboard>,
     xkb_context: xkb::Context,
     xkb_state: Option<xkb::State>,
@@ -150,6 +152,8 @@ impl Ui {
             tab: 0,
             prompt_cursor: app.settings.prompt.chars().count(),
             prompt_focused: false,
+            server_cursor: app.settings.base_url.chars().count(),
+            server_focused: false,
             seat_keyboard: None,
             xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
             xkb_state: None,
@@ -175,12 +179,48 @@ impl Ui {
             .map(|i| i + 1)
             .unwrap_or(0);
         self.prompt_cursor = self.draft.prompt.chars().count();
+        self.server_cursor = self.draft.base_url.chars().count();
         self.open_select = None;
         self.prompt_focused = false;
+        self.server_focused = false;
         self.dirty = true;
     }
     pub fn settings_saved(&mut self, settings: &crate::settings::Settings) {
         self.saved = settings.clone();
+    }
+    pub fn server_saved(&mut self, base_url: &str) {
+        self.saved.base_url = base_url.into();
+        self.draft.base_url = base_url.into();
+        self.models.clear();
+        self.sync_model_indices();
+        self.message = "Servidor guardado · cargando catálogo…".into();
+        self.dirty = true;
+    }
+    fn edit_server(&mut self, sym: xkb::Keysym, text: &str) {
+        let mut chars: Vec<char> = self.draft.base_url.chars().collect();
+        self.server_cursor = self.server_cursor.min(chars.len());
+        match sym {
+            xkb::Keysym::BackSpace if self.server_cursor > 0 => {
+                self.server_cursor -= 1;
+                chars.remove(self.server_cursor);
+            }
+            xkb::Keysym::Delete if self.server_cursor < chars.len() => {
+                chars.remove(self.server_cursor);
+            }
+            xkb::Keysym::Left => self.server_cursor = self.server_cursor.saturating_sub(1),
+            xkb::Keysym::Right => self.server_cursor = (self.server_cursor + 1).min(chars.len()),
+            xkb::Keysym::Home => self.server_cursor = 0,
+            xkb::Keysym::End => self.server_cursor = chars.len(),
+            _ if !text.is_empty() && !text.chars().any(char::is_control) => {
+                let inserted: Vec<char> = text.chars().collect();
+                let count = inserted.len();
+                chars.splice(self.server_cursor..self.server_cursor, inserted);
+                self.server_cursor += count;
+            }
+            _ => return,
+        }
+        self.draft.base_url = chars.into_iter().collect();
+        self.dirty = true;
     }
     pub fn position_saved(&mut self, x: i32) {
         self.saved.x = x;
@@ -279,6 +319,9 @@ impl Ui {
                     prompt: &self.draft.prompt,
                     prompt_cursor: self.prompt_cursor,
                     prompt_focused: self.prompt_focused,
+                    base_url: &self.draft.base_url,
+                    server_cursor: self.server_cursor,
+                    server_focused: self.server_focused,
                 },
             )?;
             let surface = self.modal_surface.as_ref().unwrap().clone();
@@ -491,11 +534,19 @@ impl Ui {
                 self.tab = 0;
                 self.open_select = None;
                 self.prompt_focused = false;
+                self.server_focused = false;
                 self.dirty = true;
                 return;
             } else if (132.0..280.0).contains(&x) {
                 self.tab = 1;
                 self.open_select = None;
+                self.server_focused = false;
+                self.dirty = true;
+                return;
+            } else if (282.0..400.0).contains(&x) {
+                self.tab = 2;
+                self.open_select = None;
+                self.prompt_focused = false;
                 self.dirty = true;
                 return;
             }
@@ -503,6 +554,22 @@ impl Ui {
 
         let actions_y = 412.;
 
+        if self.tab == 2 {
+            let (left, top, width, height) = crate::paint::SERVER_BOX;
+            self.server_focused =
+                (left..left + width).contains(&x) && (top..top + height).contains(&y);
+            if self.server_focused {
+                self.server_cursor = self.draft.base_url.chars().count();
+            } else if (actions_y..actions_y + 40.).contains(&y) {
+                if (26.0..206.0).contains(&x) {
+                    let _ = self.tx.send(Event::SaveServer(self.draft.base_url.clone()));
+                } else if (216.0..326.0).contains(&x) {
+                    self.toggle_modal(qh);
+                }
+            }
+            self.dirty = true;
+            return;
+        }
         if self.tab == 0 {
             if let Some(idx) = self.open_select {
                 let count = match idx {
@@ -792,6 +859,18 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Ui {
                 key,
                 state: Value(wl_keyboard::KeyState::Pressed),
                 ..
+            } if state.panel && state.tab == 2 && state.server_focused => {
+                let xkb_key = xkb::Keycode::new(key + 8);
+                if let Some(xkb_state) = &state.xkb_state {
+                    let sym = xkb_state.key_get_one_sym(xkb_key);
+                    let text = xkb_state.key_get_utf8(xkb_key);
+                    state.edit_server(sym, &text);
+                }
+            }
+            wl_keyboard::Event::Key {
+                key,
+                state: Value(wl_keyboard::KeyState::Pressed),
+                ..
             } if state.panel && state.tab == 1 && state.prompt_focused => {
                 let xkb_key = xkb::Keycode::new(key + 8);
                 if let Some(xkb_state) = &state.xkb_state {
@@ -953,7 +1032,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Ui {
                         state.draft.temperature = state.draft.temperature.clamp(0.0, 1.0);
                         state.dirty = true;
                     }
-                } else {
+                } else if state.tab == 0 {
                     match state.open_select {
                         Some(0) => {
                             let len = state.accounts().len() as isize;
@@ -1229,6 +1308,7 @@ mod tests {
         let expected = format!("{:?}", ui.saved);
         ui.draft = crate::settings::Settings {
             model: "other/model".into(),
+            base_url: "https://unsaved.example".into(),
             x: 1,
             shortcut: "CTRL + ALT + D".into(),
             microphone: "other-mic".into(),
@@ -1273,7 +1353,12 @@ mod tests {
 
     #[test]
     fn every_close_button_discards_without_saving() {
-        for (tab, pointer_xy) in [(0, (460., 20.)), (0, (230., 420.)), (1, (350., 420.))] {
+        for (tab, pointer_xy) in [
+            (0, (460., 20.)),
+            (0, (230., 420.)),
+            (1, (350., 420.)),
+            (2, (230., 420.)),
+        ] {
             let (mut ui, _server) = ui();
             let (tx, rx) = mpsc::channel();
             ui.tx = tx;
@@ -1321,6 +1406,98 @@ mod tests {
         assert_eq!(ui.draft.shortcut, original_shortcut);
         assert_eq!(ui.account_index, 0);
         assert_eq!(ui.model_index, 0);
+    }
+
+    #[test]
+    fn server_tab_focus_and_save_emit_only_the_url() {
+        let (mut ui, _server) = ui();
+        let (tx, rx) = mpsc::channel();
+        ui.tx = tx;
+        ui.panel = true;
+        let queue = ui.connection.new_event_queue::<Ui>();
+        ui.pointer_xy = (300., 60.);
+        ui.modal_click(&queue.handle());
+        assert_eq!(ui.tab, 2);
+        ui.pointer_xy = (100., 125.);
+        ui.modal_click(&queue.handle());
+        assert!(ui.server_focused);
+        ui.draft.base_url = "https://proxy.example".into();
+        ui.draft.shortcut = "unsaved shortcut".into();
+        ui.pointer_xy = (80., 425.);
+        ui.modal_click(&queue.handle());
+        assert!(
+            matches!(rx.try_recv().unwrap(), Event::SaveServer(url) if url == "https://proxy.example")
+        );
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(ui.saved.base_url, crate::settings::DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn server_save_updates_snapshot_without_committing_other_edits_and_clears_catalog() {
+        let (mut ui, _server) = ui();
+        let original_shortcut = ui.saved.shortcut.clone();
+        ui.draft.shortcut = "unsaved shortcut".into();
+        ui.server_saved("https://proxy.example");
+        assert!(ui.models.is_empty());
+        assert_eq!(ui.draft.shortcut, "unsaved shortcut");
+        assert_eq!(ui.saved.shortcut, original_shortcut);
+        ui.discard_draft();
+        assert_eq!(ui.draft.base_url, "https://proxy.example");
+        assert_eq!(ui.draft.shortcut, original_shortcut);
+    }
+
+    #[test]
+    fn stale_catalog_success_and_failure_do_not_change_ui_or_phase() {
+        let (mut ui, _server) = ui();
+        let mut app = crate::tests::app(hypr_dictate::Phase::Idle);
+        app.catalog_generation = 3;
+        let models = ui.models.clone();
+        let message = ui.message.clone();
+        for result in [
+            Ok(vec!["old/model".into()]),
+            Err(anyhow::anyhow!("old failure")),
+        ] {
+            app.event(
+                Event::Catalog(app.settings.base_url.clone(), 1, result),
+                &mut ui,
+            );
+            assert_eq!(ui.models, models);
+            assert_eq!(ui.message, message);
+            assert_eq!(app.phase, hypr_dictate::Phase::Idle);
+        }
+        app.event(
+            Event::Catalog(
+                app.settings.base_url.clone(),
+                3,
+                Ok(vec!["new/model".into()]),
+            ),
+            &mut ui,
+        );
+        assert_eq!(ui.models, ["new/model"]);
+    }
+
+    #[test]
+    fn server_editor_changes_only_draft_until_saved_or_discarded() {
+        let (mut ui, _server) = ui();
+        let original = ui.saved.base_url.clone();
+        ui.draft.base_url = "http://127.0.0.1:8317".into();
+        ui.server_cursor = ui.draft.base_url.chars().count();
+        ui.edit_server(xkb::Keysym::End, "");
+        ui.edit_server(xkb::Keysym::BackSpace, "");
+        ui.edit_server(xkb::Keysym::NoSymbol, "8");
+        assert_eq!(ui.draft.base_url, "http://127.0.0.1:8318");
+        assert_eq!(ui.saved.base_url, original);
+        ui.edit_server(xkb::Keysym::Home, "");
+        ui.edit_server(xkb::Keysym::Delete, "");
+        assert_eq!(ui.draft.base_url, "ttp://127.0.0.1:8318");
+        let before = ui.draft.base_url.clone();
+        ui.edit_server(xkb::Keysym::Return, "\r");
+        ui.edit_server(xkb::Keysym::NoSymbol, "\n\t");
+        assert_eq!(ui.draft.base_url, before);
+        ui.server_focused = true;
+        ui.discard_draft();
+        assert_eq!(ui.draft.base_url, original);
+        assert!(!ui.server_focused);
     }
 
     #[test]

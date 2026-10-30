@@ -16,6 +16,9 @@ pub struct Modal<'a> {
     pub prompt: &'a str,
     pub prompt_cursor: usize,
     pub prompt_focused: bool,
+    pub base_url: &'a str,
+    pub server_cursor: usize,
+    pub server_focused: bool,
 }
 
 /// Row top offsets for the five selector fields in the modal. Kept as a
@@ -27,6 +30,8 @@ pub const MODAL_HEIGHT: i32 = 530;
 
 pub const TAB_GENERAL_RECT: (f64, f64, f64, f64) = (26., 44., 100., 28.);
 pub const TAB_IA_RECT: (f64, f64, f64, f64) = (134., 44., 140., 28.);
+pub const TAB_SERVER_RECT: (f64, f64, f64, f64) = (282., 44., 118., 28.);
+pub const SERVER_BOX: (f64, f64, f64, f64) = (26., 112., 488., 40.);
 pub const TEMP_BOX: (f64, f64, f64, f64) = (26., 92., 488., 40.);
 pub const PROMPT_BOX: (f64, f64, f64, f64) = (26., 156., 488., 238.);
 pub const BTN_RESTORE_IA: (f64, f64, f64, f64) = (186., 412., 140., 38.);
@@ -259,6 +264,7 @@ pub fn modal(width: i32, height: i32, color: [u8; 3], m: &Modal<'_>) -> Result<V
         for (tab_idx, (label, (tx, ty, tw, th))) in [
             ("General", TAB_GENERAL_RECT),
             ("Parámetros e IA", TAB_IA_RECT),
+            ("Servidor", TAB_SERVER_RECT),
         ]
         .into_iter()
         .enumerate()
@@ -328,6 +334,88 @@ pub fn modal(width: i32, height: i32, color: [u8; 3], m: &Modal<'_>) -> Result<V
             c.move_to(56., actions_y + 24.);
             c.show_text("Guardar cambios")?;
 
+            c.set_source_rgba(0.15, 0.18, 0.26, 0.95);
+            rounded(&c, 216., actions_y, 110., 38., 9.);
+            c.fill()?;
+            c.set_source_rgb(0.87, 0.9, 0.96);
+            c.move_to(248., actions_y + 24.);
+            c.show_text("Cerrar")?;
+        } else if m.tab == 2 {
+            c.set_source_rgb(0.68, 0.73, 0.84);
+            c.move_to(26., 96.);
+            c.show_text("URL base de CLIProxyAPI")?;
+            rounded(
+                &c,
+                SERVER_BOX.0,
+                SERVER_BOX.1,
+                SERVER_BOX.2,
+                SERVER_BOX.3,
+                9.,
+            );
+            c.set_source_rgba(0.09, 0.11, 0.16, 0.98);
+            c.fill_preserve()?;
+            c.set_source_rgba(
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                if m.server_focused { 0.95 } else { 0.32 },
+            );
+            c.set_line_width(1.2);
+            c.stroke()?;
+            c.save()?;
+            c.rectangle(
+                SERVER_BOX.0 + 8.,
+                SERVER_BOX.1 + 4.,
+                SERVER_BOX.2 - 16.,
+                SERVER_BOX.3 - 8.,
+            );
+            c.clip();
+            c.select_font_face(
+                "monospace",
+                cairo::FontSlant::Normal,
+                cairo::FontWeight::Normal,
+            );
+            c.set_font_size(12.);
+            let before: String = m.base_url.chars().take(m.server_cursor).collect();
+            let cursor_width = c.text_extents(&before)?.x_advance();
+            let offset = if m.server_focused {
+                (cursor_width - SERVER_BOX.2 + 32.).max(0.)
+            } else {
+                0.
+            };
+            c.set_source_rgb(0.93, 0.95, 0.99);
+            c.move_to(SERVER_BOX.0 + 12. - offset, SERVER_BOX.1 + 25.);
+            c.show_text(m.base_url)?;
+            if m.server_focused {
+                let x = SERVER_BOX.0 + 12. + cursor_width - offset;
+                c.set_source_rgb(rgb[0], rgb[1], rgb[2]);
+                c.move_to(x, SERVER_BOX.1 + 10.);
+                c.line_to(x, SERVER_BOX.1 + 29.);
+                c.stroke()?;
+            }
+            c.restore()?;
+            c.select_font_face(
+                "sans-serif",
+                cairo::FontSlant::Normal,
+                cairo::FontWeight::Bold,
+            );
+            c.set_font_size(12.);
+            c.set_source_rgb(0.68, 0.73, 0.84);
+            for (y, line) in [
+                (180., "HTTP o HTTPS; sin /v1, credenciales ni parámetros."),
+                (204., "Guardar servidor recarga el catálogo sin reiniciar."),
+                (228., "No guarda otros cambios pendientes del modal."),
+                (252., "Después elige un modelo compatible en General."),
+            ] {
+                c.move_to(26., y);
+                c.show_text(line)?;
+            }
+            c.set_source_rgb(rgb[0], rgb[1], rgb[2]);
+            rounded(&c, 26., actions_y, 180., 38., 9.);
+            c.fill()?;
+            c.set_source_rgb(0.04, 0.05, 0.08);
+            c.move_to(50., actions_y + 24.);
+            c.show_text("Guardar servidor")?;
             c.set_source_rgba(0.15, 0.18, 0.26, 0.95);
             rounded(&c, 216., actions_y, 110., 38., 9.);
             c.fill()?;
@@ -579,7 +667,7 @@ mod tests {
         assert_eq!(&expanded[0..4], &[0, 0, 0, 0]);
 
         let options = vec!["cic".into(), "j0k3r".into()];
-        let m = Modal {
+        let mut m = Modal {
             tab: 0,
             account: "cic",
             model: "cic/gemini-3.5-flash-lite",
@@ -594,11 +682,18 @@ mod tests {
             prompt: "Prompt",
             prompt_cursor: 6,
             prompt_focused: false,
+            base_url: "http://127.0.0.1:8317",
+            server_cursor: 21,
+            server_focused: false,
         };
-        assert_eq!(
-            modal(540, MODAL_HEIGHT, [55, 170, 130], &m).unwrap().len(),
-            540 * MODAL_HEIGHT as usize * 4
-        );
+        for tab in 0..3 {
+            m.tab = tab;
+            m.server_focused = tab == 2;
+            assert_eq!(
+                modal(540, MODAL_HEIGHT, [55, 170, 130], &m).unwrap().len(),
+                540 * MODAL_HEIGHT as usize * 4
+            );
+        }
     }
     #[test]
     fn ease_curve_starts_at_zero_ends_at_one_and_is_monotonic() {

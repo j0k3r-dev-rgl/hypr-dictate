@@ -23,9 +23,10 @@ use std::{
 pub enum Event {
     Command(String),
     Finished(u64, Result<(String, String)>),
-    Catalog(Result<Vec<String>>),
+    Catalog(String, u64, Result<Vec<String>>),
     Save(settings::Settings),
     SavePosition(i32),
+    SaveServer(String),
 }
 struct Capture {
     child: Child,
@@ -36,6 +37,7 @@ pub struct App {
     phase: Phase,
     capture: Option<Capture>,
     last_request_id: u64,
+    catalog_generation: u64,
     tx: mpsc::Sender<Event>,
     client: reqwest::blocking::Client,
     key: String,
@@ -65,6 +67,10 @@ impl App {
         if !matches!(self.phase, Phase::Idle | Phase::Error) {
             return Ok(());
         }
+        ensure!(
+            !self.settings.model.trim().is_empty(),
+            "Selecciona y guarda un modelo del catálogo antes de grabar"
+        );
         self.discard_capture();
         let address = active_address()?;
         ensure!(valid_address(&address), "No hay ventana enfocada válida");
@@ -232,6 +238,39 @@ impl App {
         });
         Ok(())
     }
+    fn save_server(
+        &mut self,
+        base_url: &str,
+        persist: impl FnOnce(&settings::Settings) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            !matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)),
+            "Espera a terminar el dictado"
+        );
+        let (endpoint, _) = api_endpoints(Some(base_url))?;
+        let mut settings = self.settings.clone();
+        settings.base_url = base_url.into();
+        persist(&settings)?;
+        self.settings = settings;
+        self.endpoint = endpoint;
+        Ok(())
+    }
+    fn request_catalog(&mut self) {
+        self.catalog_generation += 1;
+        let generation = self.catalog_generation;
+        let base_url = self.settings.base_url.clone();
+        let client = self.client.clone();
+        let key = self.key.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = api_endpoints(Some(&base_url))
+                .and_then(|(_, endpoint)| fetch_catalog(&client, &endpoint, &key));
+            let _ = tx.send(Event::Catalog(base_url, generation, result));
+        });
+    }
+    fn catalog_is_current(&self, base_url: &str, generation: u64) -> bool {
+        self.settings.base_url == base_url && self.catalog_generation == generation
+    }
     fn save_position(
         &mut self,
         x: i32,
@@ -312,14 +351,25 @@ impl App {
                 }
                 _ => Ok(()),
             },
-            Event::Catalog(result) => match result {
-                Ok(models) => {
-                    ui.models = models;
-                    ui.catalog_loaded();
-                    Ok(())
+            Event::Catalog(base_url, generation, result) => {
+                if !self.catalog_is_current(&base_url, generation) {
+                    return;
                 }
-                Err(e) => Err(e),
-            },
+                match result {
+                    Ok(models) => {
+                        ui.models = models;
+                        ui.catalog_loaded();
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Event::SaveServer(base_url) => self
+                .save_server(&base_url, settings::Settings::save)
+                .map(|()| {
+                    ui.server_saved(&self.settings.base_url);
+                    self.request_catalog();
+                }),
             Event::SavePosition(x) => self.save_position(x, settings::Settings::save).map(|()| {
                 ui.position_saved(self.settings.x);
             }),
@@ -345,6 +395,8 @@ impl App {
                 if settings.shortcut != self.settings.shortcut {
                     shortcut::apply(&settings.shortcut, &self.settings.shortcut)?;
                 }
+                let mut settings = settings;
+                settings.base_url = self.settings.base_url.clone();
                 settings.save()?;
                 self.settings = settings;
                 ui.settings_saved(&self.settings);
@@ -368,6 +420,41 @@ impl Drop for App {
     fn drop(&mut self) {
         self.discard_capture();
     }
+}
+fn api_endpoints(base: Option<&str>) -> Result<(String, String)> {
+    let base = base.unwrap_or(settings::DEFAULT_BASE_URL);
+    let mut url = reqwest::Url::parse(base)
+        .map_err(|_| anyhow::anyhow!("La URL del servidor no es válida"))?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "La URL del servidor debe usar HTTP o HTTPS, sin credenciales, parámetros ni fragmentos"
+    );
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&format!("{path}/v1/chat/completions"));
+    let transcription = url.to_string();
+    url.set_path(&format!("{path}/v1/models"));
+    url.set_query(Some("client_version=1"));
+    Ok((transcription, url.into()))
+}
+fn fetch_catalog(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    key: &str,
+) -> Result<Vec<String>> {
+    let response = client
+        .get(endpoint)
+        .bearer_auth(key)
+        .send()?
+        .error_for_status()?;
+    let value: Value = response.json()?;
+    let models = settings::routes(&value);
+    ensure!(!models.is_empty(), "Catálogo de modelos vacío");
+    Ok(models)
 }
 fn transcription_request(
     client: &reqwest::blocking::Client,
@@ -478,6 +565,8 @@ fn main() -> Result<()> {
     }
     let key = std::env::var("CLIPROXYAPI_API_KEY").context("Falta CLIPROXYAPI_API_KEY")?;
     ensure!(!key.is_empty(), "CLIPROXYAPI_API_KEY está vacía");
+    let settings = settings::Settings::load()?;
+    let (endpoint, _) = api_endpoints(Some(&settings.base_url))?;
     // Never unlink an existing path: it may belong to another live process.
     let listener = UnixListener::bind(&path).context(
         "Socket ocupado: si no hay otro proceso, elimina manualmente el socket residual",
@@ -503,10 +592,11 @@ fn main() -> Result<()> {
             }
         }
     });
-    let app = App {
+    let mut app = App {
         phase: Phase::Idle,
         capture: None,
         last_request_id: 0,
+        catalog_generation: 0,
         tx,
         client: reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(25))
@@ -514,28 +604,12 @@ fn main() -> Result<()> {
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
         key,
-        endpoint: "http://192.168.0.100:8317/v1/chat/completions".into(),
-        settings: settings::Settings::load()?,
+        endpoint,
+        settings,
         level: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         error: String::new(),
     };
-    let catalog_client = app.client.clone();
-    let catalog_key = app.key.clone();
-    let catalog_tx = app.tx.clone();
-    thread::spawn(move || {
-        let result = (|| -> Result<Vec<String>> {
-            let response = catalog_client
-                .get("http://192.168.0.100:8317/v1/models?client_version=1")
-                .bearer_auth(catalog_key)
-                .send()?
-                .error_for_status()?;
-            let value: Value = response.json()?;
-            let models = settings::routes(&value);
-            ensure!(!models.is_empty(), "Catálogo de modelos vacío");
-            Ok(models)
-        })();
-        let _ = catalog_tx.send(Event::Catalog(result));
-    });
+    app.request_catalog();
     ui::run(app, rx)
 }
 
@@ -549,6 +623,7 @@ mod tests {
             phase,
             capture: None,
             last_request_id: 2,
+            catalog_generation: 0,
             tx,
             client: reqwest::blocking::Client::builder()
                 .no_proxy()
@@ -597,6 +672,180 @@ mod tests {
             assert_eq!(format!("{:?}", app.phase), expected);
             assert!(app.error.is_empty());
         }
+    }
+
+    #[test]
+    fn saving_server_works_without_catalog_and_preserves_other_settings() {
+        let mut app = app(Phase::Idle);
+        app.settings.model = "saved/model".into();
+        app.settings.shortcut = "SUPER + F9".into();
+        let mut expected = app.settings.clone();
+        expected.base_url = "https://proxy.example/service".into();
+        let mut calls = 0;
+        app.save_server(&expected.base_url, |candidate| {
+            calls += 1;
+            assert_eq!(format!("{candidate:?}"), format!("{expected:?}"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(format!("{:?}", app.settings), format!("{expected:?}"));
+        assert_eq!(
+            app.endpoint,
+            "https://proxy.example/service/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn server_save_failures_or_active_dictation_do_not_apply_changes() {
+        for phase in [Phase::Recording("0xabc".into()), Phase::Processing(1)] {
+            let mut app = app(phase);
+            let original = format!("{:?}", app.settings);
+            let error = app
+                .save_server("http://127.0.0.1:9000", |_| {
+                    panic!("must not persist server during dictation")
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("Espera a terminar"));
+            assert_eq!(format!("{:?}", app.settings), original);
+        }
+        let mut app = app(Phase::Idle);
+        let original = format!("{:?}", app.settings);
+        app.save_server("http://127.0.0.1:9000", |_| bail!("disk full"))
+            .unwrap_err();
+        assert_eq!(format!("{:?}", app.settings), original);
+        assert!(app.endpoint.is_empty());
+        app.save_server("ftp://invalid", |_| panic!("invalid URL must not persist"))
+            .unwrap_err();
+    }
+
+    #[test]
+    fn catalogue_replies_must_match_server_and_generation() {
+        let mut app = app(Phase::Idle);
+        app.settings.base_url = "http://127.0.0.1:9000".into();
+        app.catalog_generation = 3;
+        assert!(app.catalog_is_current("http://127.0.0.1:9000", 3));
+        assert!(!app.catalog_is_current("http://127.0.0.1:8317", 3));
+        assert!(!app.catalog_is_current("http://127.0.0.1:9000", 1));
+    }
+
+    #[test]
+    fn api_urls_use_default_or_configured_http_and_https_base() {
+        for (base, root) in [
+            (None, "http://127.0.0.1:8317"),
+            (Some("http://127.0.0.1:9000/"), "http://127.0.0.1:9000"),
+            (Some("https://proxy.example"), "https://proxy.example"),
+            (
+                Some("https://proxy.example/service/"),
+                "https://proxy.example/service",
+            ),
+        ] {
+            let (transcription, catalog) = api_endpoints(base).unwrap();
+            assert_eq!(transcription, format!("{root}/v1/chat/completions"));
+            assert_eq!(catalog, format!("{root}/v1/models?client_version=1"));
+        }
+    }
+
+    #[test]
+    fn configured_server_receives_catalog_and_transcription_requests() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/proxy/", listener.local_addr().unwrap());
+        let (transcription, _) = api_endpoints(Some(&base)).unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in [r#"{"data":[{"id":"available/model"}]}"#, "{}"] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let length = request
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    })
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                socket.read_exact(&mut vec![0; length]).unwrap();
+                requests.push(request.lines().next().unwrap().to_owned());
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut app = app(Phase::Idle);
+        app.client = client.clone();
+        app.tx = tx;
+        app.settings.base_url = base.clone();
+        app.request_catalog();
+        let Event::Catalog(reply_base, generation, models) =
+            rx.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("expected catalogue reply");
+        };
+        assert_eq!(reply_base, base);
+        assert_eq!(generation, 1);
+        assert!(app.catalog_is_current(&reply_base, generation));
+        let models = models.unwrap();
+        let body = send_transcription(transcription_request(
+            &client,
+            &transcription,
+            "test",
+            &json!({}),
+        ))
+        .unwrap();
+        assert_eq!(models, ["available/model"]);
+        assert_eq!(body, b"{}");
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "GET /proxy/v1/models?client_version=1 HTTP/1.1",
+                "POST /proxy/v1/chat/completions HTTP/1.1",
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_or_ambiguous_api_base_is_rejected_without_echoing_it() {
+        for base in [
+            "",
+            "not-a-url",
+            "ftp://proxy.example",
+            "file:///tmp/api",
+            "http://",
+            "https://user:secret@proxy.example",
+            "https://proxy.example?key=secret",
+            "https://proxy.example#fragment",
+        ] {
+            let error = api_endpoints(Some(base)).unwrap_err();
+            assert!(error.to_string().contains("URL del servidor"));
+            assert!(!format!("{error:#}").contains("secret"));
+        }
+    }
+
+    #[test]
+    fn recording_without_a_saved_model_is_rejected_before_capture_or_focus_access() {
+        let mut app = app(Phase::Idle);
+        app.settings.model.clear();
+        let error = app.start(false).unwrap_err();
+        assert!(
+            error.to_string().contains("Selecciona y guarda un modelo"),
+            "{error:#}"
+        );
+        assert_eq!(app.phase, Phase::Idle);
+        assert!(app.capture.is_none());
     }
 
     fn delayed_api(send_headers_first: bool, delay: Duration) -> (String, thread::JoinHandle<()>) {
@@ -824,6 +1073,7 @@ mod tests {
             let mut app = app(phase);
             app.settings = settings::Settings {
                 model: "offline/model".into(),
+                base_url: settings::DEFAULT_BASE_URL.into(),
                 x: 123,
                 shortcut: "SUPER + F9".into(),
                 microphone: "saved-mic".into(),
