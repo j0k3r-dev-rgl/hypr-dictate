@@ -212,20 +212,8 @@ impl App {
                         ]
                     }]
                 });
-                let response = client
-                    .post(&endpoint)
-                    .bearer_auth(key)
-                    .json(&body)
-                    .send()
-                    .context("No se pudo conectar con la API")?;
-                ensure!(
-                    response.status().is_success(),
-                    "API devolvió HTTP {}",
-                    response.status()
-                );
-                let mut bytes = Vec::new();
-                response.take(2_000_001).read_to_end(&mut bytes)?;
-                ensure!(bytes.len() <= 2_000_000, "Respuesta demasiado grande");
+                let request = transcription_request(&client, &endpoint, &key, &body);
+                let bytes = send_transcription(request)?;
                 let response: Value =
                     serde_json::from_slice(&bytes).context("Respuesta JSON inválida")?;
                 ensure!(
@@ -380,6 +368,54 @@ impl Drop for App {
     fn drop(&mut self) {
         self.discard_capture();
     }
+}
+fn transcription_request(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    key: &str,
+    body: &Value,
+) -> reqwest::blocking::RequestBuilder {
+    client
+        .post(endpoint)
+        .bearer_auth(key)
+        .json(body)
+        .timeout(Duration::from_secs(120))
+}
+fn transcription_error(error: anyhow::Error) -> anyhow::Error {
+    let timed_out = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                error.kind() == std::io::ErrorKind::TimedOut
+                    || error
+                        .get_ref()
+                        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+                        .is_some_and(reqwest::Error::is_timeout)
+            })
+    });
+    error.context(if timed_out {
+        "Tiempo de espera agotado durante la transcripción"
+    } else {
+        "Falló la comunicación con la API durante la transcripción"
+    })
+}
+fn send_transcription(request: reqwest::blocking::RequestBuilder) -> Result<Vec<u8>> {
+    let response = request
+        .send()
+        .map_err(|error| transcription_error(error.into()))?;
+    ensure!(
+        response.status().is_success(),
+        "API devolvió HTTP {}",
+        response.status()
+    );
+    let mut bytes = Vec::new();
+    response
+        .take(2_000_001)
+        .read_to_end(&mut bytes)
+        .map_err(|error| transcription_error(error.into()))?;
+    ensure!(bytes.len() <= 2_000_000, "Respuesta demasiado grande");
+    Ok(bytes)
 }
 fn hypr(args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("hyprctl").args(args).output()?;
@@ -561,6 +597,124 @@ mod tests {
             assert_eq!(format!("{:?}", app.phase), expected);
             assert!(app.error.is_empty());
         }
+    }
+
+    fn delayed_api(send_headers_first: bool, delay: Duration) -> (String, thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let length = String::from_utf8(request)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                })
+                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                .unwrap_or(0);
+            socket.read_exact(&mut vec![0; length]).unwrap();
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+            if send_headers_first {
+                socket.write_all(headers).unwrap();
+            }
+            thread::sleep(delay);
+            if !send_headers_first && socket.write_all(headers).is_err() {
+                return;
+            }
+            let _ = socket.write_all(b"{}");
+        });
+        (endpoint, server)
+    }
+
+    #[test]
+    fn transcription_uses_120_seconds_without_changing_catalog_timeout() {
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(25))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let request = transcription_request(&client, "http://127.0.0.1/", "test", &json!({}))
+            .build()
+            .unwrap();
+        assert_eq!(request.timeout(), Some(&Duration::from_secs(120)));
+        let catalog = client.get("http://127.0.0.1/v1/models").build().unwrap();
+        assert_eq!(
+            catalog.timeout(),
+            None,
+            "catalog must retain the client default"
+        );
+    }
+
+    #[test]
+    fn transcription_can_outlive_the_client_default_timeout() {
+        let (endpoint, server) = delayed_api(false, Duration::from_millis(150));
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let result = send_transcription(transcription_request(
+            &client,
+            &endpoint,
+            "test",
+            &json!({}),
+        ));
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), b"{}");
+    }
+
+    #[test]
+    fn transcription_timeout_is_identified_before_headers_and_during_body() {
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        for send_headers_first in [false, true] {
+            let (endpoint, server) = delayed_api(send_headers_first, Duration::from_millis(200));
+            let request = transcription_request(&client, &endpoint, "test", &json!({}))
+                .timeout(Duration::from_millis(100));
+            let error = send_transcription(request).unwrap_err();
+            server.join().unwrap();
+            assert!(
+                error.to_string().contains("Tiempo de espera agotado"),
+                "{error:#}"
+            );
+            assert!(!error.to_string().contains("conectar"));
+        }
+    }
+
+    #[test]
+    fn transcription_connection_failure_is_not_reported_as_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let error = send_transcription(transcription_request(
+            &client,
+            &endpoint,
+            "test",
+            &json!({}),
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("comunicación"), "{error:#}");
+        assert!(!error.to_string().contains("Tiempo de espera agotado"));
     }
 
     #[test]

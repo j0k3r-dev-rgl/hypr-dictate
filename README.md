@@ -37,15 +37,16 @@ Suelta la tecla principal antes que los modificadores para que coincida el bindi
 ## Comportamiento y límites
 
 - Captura PCM mono a 16 kHz en memoria, hasta cinco minutos (9,6 MB de PCM). Al alcanzar ese límite, la captura termina; debes detener el dictado para enviar lo capturado. WAV y base64 generan copias temporales adicionales en memoria.
-- Al parar, envía una petición sin reintentos automáticos. Timeout de 120 segundos. La espera depende del servidor y la duración del audio; las pruebas previas de fragmentos cortos rondaron tres segundos, no tiempo real.
+- Al parar, envía una petición sin reintentos automáticos. El timeout total de transcripción es de 120 segundos e incluye subida, procesamiento del servidor y lectura de la respuesta; la conexión tiene un límite de 5 segundos. El catálogo mantiene un timeout total de 25 segundos y de conexión de 5 segundos. Si se agota el tiempo de transcripción, se informa como tal. La espera depende del servidor y la duración del audio; las pruebas previas de fragmentos cortos rondaron tres segundos, no tiempo real.
 - Antes de insertar, comprueba que la ventana original sigue existiendo, la enfoca y verifica el foco. Si ya no existe, no escribe en otra ventana.
 - Conserva la ventana, no la posición interna del cursor. No cambies de campo durante la petición. Las comprobaciones de foco reducen el riesgo, pero no son atómicas con la escritura: evita cambiar de ventana durante la inserción.
-- **Primera prueba en un editor vacío, nunca en una terminal:** los saltos de línea se envían como Enter y podrían ejecutar comandos. La compatibilidad depende de la aplicación; terminales y formularios pueden interpretar teclas de forma distinta.
-- Una sola grabación/petición a la vez. Hasta 240 caracteres Unicode distintos por transcripción. Respuestas truncadas o inválidas no se insertan.
+- **Primera prueba en un editor vacío, nunca en una terminal:** la inserción simula teclas y su interpretación depende de la aplicación. Los saltos de línea y tabulaciones se convierten en espacios y los demás caracteres de control se eliminan; no se envían como Enter ni Tab.
+- Una sola grabación activa. Cancelar durante «Procesando» descarta el resultado y permite comenzar otra grabación, pero la petición HTTP anterior puede seguir en curso hasta terminar o agotar su timeout.
+- La inserción usa bloques de hasta 10 caracteres Unicode distintos, sin un límite global de 240. La respuesta está limitada a 2 MB y la transcripción a 100 000 bytes UTF-8. Respuestas truncadas o inválidas no se insertan.
 - No guarda audio ni texto. Un fallo de API o de inserción descarta el resultado; una interrupción durante la escritura puede dejar texto parcial, sin reintento para evitar duplicados.
 - La API usa HTTP en la LAN: clave y audio no están cifrados en tránsito. Usa solo una red de confianza.
 - Usa un socket local con permisos 0600 en `$XDG_RUNTIME_DIR/hypr-dictate.sock`. Si el proceso termina abruptamente puede quedar un socket residual. Elimínalo manualmente únicamente después de comprobar que no queda otra instancia.
-- El dibujo usa un archivo temporal anónimo de memoria compartida para píxeles; no contiene audio, clave ni transcripciones. El keymap temporal contiene los caracteres únicos necesarios para escribir, no su orden. El sistema puede usar swap: no se garantiza borrado seguro de memoria.
+- Los píxeles y los keymaps del teclado virtual usan archivos temporales sin nombre creados con `tempfile`, no `memfd`. Pueden pasar por disco según el directorio temporal del sistema (`$TMPDIR`, normalmente `/tmp`) y su sistema de archivos. Los archivos de píxeles no contienen audio, clave ni transcripciones; los keymaps sí contienen caracteres del texto, ordenados por primera aparición en cada bloque de hasta 10 caracteres distintos. La secuencia de bloques revela parte del orden de la transcripción. El sistema también puede usar swap: no se garantiza borrado seguro.
 
 ## Validar
 
