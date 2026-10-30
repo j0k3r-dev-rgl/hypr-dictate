@@ -1,10 +1,10 @@
 # hypr-dictate
 
-Dictado ligero para Hyprland: graba, envía una petición a CLIProxyAPI y escribe la transcripción completa en la ventana enfocada al comenzar. Rust y Wayland nativo, sin navegador, historial ni portapapeles.
+Dictado ligero para Hyprland: graba, envía una petición a CLIProxyAPI y escribe la transcripción completa en la ventana enfocada al comenzar. Rust y Wayland nativo, sin navegador ni historial; la inserción del dictado no usa el portapapeles.
 
 ## Compilar y ejecutar
 
-Requiere Rust para compilar; en ejecución, Hyprland con layer-shell y teclado virtual, PipeWire, `pw-record` y `hyprctl`.
+Requiere Rust, `pkg-config` y las bibliotecas de desarrollo de GTK4 para compilar. En ejecución: GTK4, un tema de iconos simbólicos (por ejemplo, Adwaita), Hyprland con layer-shell y teclado virtual, PipeWire, `pw-record` y `hyprctl`.
 
 ```bash
 cargo build --release
@@ -12,23 +12,25 @@ cargo build --release
 ./target/release/hypr-dictate run
 ```
 
-El caparazón oscuro aparece muy bajo y pegado al borde inferior. Al grabar se expande con una transición y muestra el nivel real de voz; al terminar de transcribir vuelve suavemente a su tamaño compacto. Clic izquierdo para grabar o detener; arrastre izquierdo para moverlo horizontalmente. Clic derecho abre o cierra un modal centrado de configuración. En reposo no captura audio ni mantiene animaciones activas.
+El caparazón oscuro aparece muy bajo y pegado al borde inferior. Al grabar se expande con una transición y muestra el nivel real de voz; al terminar de transcribir vuelve suavemente a su tamaño compacto. Clic izquierdo para grabar o detener; arrastre izquierdo para moverlo horizontalmente. Clic derecho abre o cierra una ventana de ajustes GTK4. Hyprland controla su posición y foco; el dock sigue siendo una superficie Wayland independiente. En reposo no captura audio ni mantiene animaciones activas.
 
-En el modal centrado, cada campo (cuenta/ruta, modelo y atajo) funciona como un selector desplegable: haz clic para abrir la lista y elegir una opción, o usa la rueda para recorrerla. «Automática» muestra modelos sin prefijo. Son rutas del catálogo, no credenciales verificadas; no todos los modelos aceptan audio. Pulsa **Guardar cambios** para aplicarlos. Las preferencias sin secretos se guardan en `~/.config/hypr-dictate/settings.json`.
+Los ajustes usan controles GTK4 nativos: desplegables con búsqueda, campo de URL y editor de prompt con selección, portapapeles, deshacer y scroll. Tab permite recorrer los controles; Shift+Tab vuelve atrás. Los iconos simbólicos vienen del tema del sistema y acompañan etiquetas y ayudas, sin una biblioteca adicional de iconos.
+
+En **General**, «Automática» muestra modelos sin prefijo. Son rutas del catálogo, no credenciales verificadas; no todos los modelos aceptan audio. No se selecciona un modelo automáticamente. Pulsa **Guardar cambios** para aplicar modelo, atajo, micrófono, pantalla y parámetros de IA. La pantalla del dock cambia al guardar, no como vista previa. Cerrar por el botón o por el gestor de ventanas descarta los cambios sin guardar. Las preferencias sin secretos se guardan en `~/.config/hypr-dictate/settings.json`.
 
 ### Servidor y modelo
 
 La clave se lee de `CLIPROXYAPI_API_KEY`, nunca de un archivo de configuración. La URL se configura desde la interfaz:
 
-1. Abre el modal con clic derecho y entra en **Servidor**.
+1. Abre los ajustes con clic derecho y entra en **Servidor**.
 2. Edita la URL base de CLIProxyAPI; por defecto es **`http://127.0.0.1:8317`**.
-3. Pulsa **Guardar servidor**. Se guarda en `settings.json` y se recarga el catálogo sin reiniciar, aunque el servidor anterior esté caído. No aplica otros cambios pendientes del modal. Cerrar sin guardar descarta la edición.
+3. Pulsa **Guardar servidor**. Se guarda en `settings.json` y se recarga el catálogo sin reiniciar, aunque el servidor anterior esté caído. No aplica otros cambios pendientes de la ventana. Cerrar sin guardar descarta la edición.
 
 Se añaden `/v1/chat/completions` para transcribir y `/v1/models?client_version=1` para el catálogo. La base admite HTTP o HTTPS, una barra final opcional y un prefijo de ruta (por ejemplo, `https://proxy.example.com/cliproxy`); no incluyas `/v1`, credenciales, parámetros ni fragmentos. Una URL vacía o inválida no se guarda. No se usa una variable de entorno para la dirección.
 
 Los ajustes anteriores sin `base_url` usan localhost. Una URL ya guardada se conserva. No se puede cambiar el servidor mientras se graba o procesa un dictado.
 
-Si no hay un modelo guardado, abre el modal, selecciona uno del catálogo que acepte audio y pulsa **Guardar cambios** antes de grabar. No se elige automáticamente una ruta ni una cuenta. Los modelos ya guardados se conservan.
+Si no hay un modelo guardado, abre los ajustes, selecciona uno del catálogo que acepte audio y pulsa **Guardar cambios** antes de grabar. No se elige automáticamente una ruta ni una cuenta. Los modelos ya guardados se conservan.
 
 ## Atajo de mantener para hablar
 
@@ -58,7 +60,7 @@ Suelta la tecla principal antes que los modificadores para que coincida el bindi
 - No guarda audio ni texto. Un fallo de API o de inserción descarta el resultado; una interrupción durante la escritura puede dejar texto parcial, sin reintento para evitar duplicados.
 - Con una URL base HTTP (incluido el valor predeterminado), clave y audio no están cifrados en tránsito: usa solo una red de confianza. Para cifrar el transporte, configura una URL HTTPS con un certificado válido; la validación TLS permanece activa y no se siguen redirecciones.
 - Usa un socket local con permisos 0600 en `$XDG_RUNTIME_DIR/hypr-dictate.sock`. Si el proceso termina abruptamente puede quedar un socket residual. Elimínalo manualmente únicamente después de comprobar que no queda otra instancia.
-- El dibujo usa un `memfd` y un pool de dos buffers por superficie. Solo reutiliza un buffer cuando el compositor lo libera; si ambos están ocupados, espera sin sobrescribirlos. El modal se repinta al cambiar su estado o el color del dictado, no por cada frame de animación del dock.
+- El dock usa un `memfd` y un pool de dos buffers. Solo reutiliza un buffer cuando el compositor lo libera; si ambos están ocupados, espera sin sobrescribirlos. GTK4 gestiona por separado el dibujo y los eventos de la ventana de ajustes; no se redibuja manualmente con cada frame del dock.
 - Los píxeles y los keymaps del teclado virtual usan `memfd`, sin archivos en `$TMPDIR`. Los buffers de píxeles no contienen audio, clave ni transcripciones; los keymaps sí contienen caracteres del texto, ordenados por primera aparición en cada bloque de hasta 10 caracteres distintos. La secuencia de bloques revela parte del orden de la transcripción. El sistema puede usar swap: no se garantiza borrado seguro de memoria.
 
 ## Validar
@@ -69,6 +71,8 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
+La prueba de widgets GTK está ignorada por defecto para no abrir ventanas durante `cargo test`; se ejecuta aparte con un display de pruebas aislado y el filtro `native_widgets_preserve -- --ignored --test-threads=1`. Se ha validado con Broadway, sin usar el compositor ni los ajustes reales.
+
 Prueba manual pendiente en la sesión gráfica:
 
 1. Abre un editor vacío, sitúa el cursor y activa el botón.
@@ -76,8 +80,9 @@ Prueba manual pendiente en la sesión gráfica:
 3. Cambia a otra ventana mientras procesa: debe volver al editor e insertar allí.
 4. Comprueba el atajo de pulsar/soltar y que no roba el foco al empezar.
 5. Cierra la ventana original durante otra petición: debe mostrar error y no escribir en la ventana alternativa.
-6. En **Servidor**, edita y guarda una URL válida: debe recargar el catálogo sin reiniciar. Cierra y abre el modal para comprobar que se conserva. Edita otra URL y cierra sin guardar: debe conservar la anterior.
+6. En **Servidor**, edita y guarda una URL válida: debe recargar el catálogo sin reiniciar. Cierra y abre los ajustes para comprobar que se conserva. Edita otra URL y cierra sin guardar: debe conservar la anterior.
 7. Con el servidor inaccesible, vuelve a **Servidor** y corrige la URL. El guardado no debe depender del catálogo anterior; una URL inválida debe mostrar un error sin aplicarse.
-8. Abre y cierra el modal varias veces mientras grabas o procesas: el dock debe seguir animándose, sin parpadeos ni bloqueos. Edita un campo y comprueba que el modal se actualiza. Cambia la pantalla del dock y descarta la vista previa para comprobar la recreación de sus buffers.
+8. Abre y cierra los ajustes varias veces mientras grabas o procesas: el dock debe seguir animándose, sin parpadeos ni bloqueos. En el prompt, prueba flechas, selección, Ctrl+A, copiar/pegar, deshacer, rueda y barra de scroll. Comprueba también la edición de la URL y el foco con Tab.
+9. Cambia la pantalla del dock y cierra sin guardar: no debe moverse. Repite y guarda: debe moverse a la pantalla elegida. Comprueba que los iconos se muestran, que la ventana se puede redimensionar y que cerrar desde Hyprland descarta el borrador.
 
 Las pruebas automáticas verifican estados, validación del destino y cabecera WAV; no sustituyen estas comprobaciones de audio, API y teclado virtual.

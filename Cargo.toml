@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 cairo-rs = { version = "0.21", default-features = false }
+gtk4 = "0.10"
 anyhow = "1"
 base64 = "0.22"
 libc = "0.2"
@@ -14,4 +15,3 @@ tempfile = "3"
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
-xkbcommon = "0.8"

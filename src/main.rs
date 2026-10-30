@@ -1,4 +1,5 @@
 mod paint;
+mod preferences;
 mod settings;
 mod shortcut;
 mod ui;
