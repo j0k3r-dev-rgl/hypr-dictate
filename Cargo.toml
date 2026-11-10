@@ -4,14 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cairo-rs = { version = "0.21", default-features = false }
-gtk4 = "0.10"
 anyhow = "1"
 base64 = "0.22"
-libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tempfile = "3"
-wayland-client = "0.31"
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-wayland-protocols-misc = { version = "0.3", features = ["client"] }
+cpal = "0.18"
+eframe = { version = "0.37", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "accesskit",
+    "clipboard",
+] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+] }

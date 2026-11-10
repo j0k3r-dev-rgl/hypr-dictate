@@ -1,899 +1,749 @@
-use crate::{App, Event, preferences::Preferences};
-use anyhow::{Context, Result, ensure};
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    io::{Seek, SeekFrom, Write},
-    os::{
-        fd::{AsFd, FromRawFd},
-        unix::fs::FileExt,
+use crate::{
+    api,
+    audio::{self, Microphone},
+    input, paint,
+    settings::{self, Settings},
+    shortcut,
+};
+use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
+use hypr_dictate::{Phase, capture_valid, sanitize_plain_text};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU32, Ordering},
+    mpsc::{Receiver, Sender, channel},
+};
+use std::thread;
+use std::time::Duration;
+
+#[derive(PartialEq, Clone, Copy)]
+pub enum SettingsTab {
+    Server,
+    General,
+}
+
+pub enum UiEvent {
+    ShortcutDown,
+    ShortcutUp,
+    IpcCommand(String),
+    CatalogLoaded(Result<Vec<String>, String>),
+    TranscriptionFinished {
+        request_id: u64,
+        address: String,
+        result: Result<String, String>,
     },
-    sync::mpsc,
-    time::Duration,
-};
-use wayland_client::{
-    Connection, Dispatch, QueueHandle, delegate_noop,
-    protocol::{
-        wl_buffer, wl_compositor, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
-        wl_surface,
-    },
-};
-use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
-    zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
-};
-use wayland_protocols_wlr::layer_shell::v1::client::{
-    zwlr_layer_shell_v1::{self, Layer},
-    zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity},
-};
-
-#[derive(Clone, Debug)]
-pub struct OutputItem {
-    pub name: String,
-    pub output: wl_output::WlOutput,
 }
 
-fn memory_file() -> Result<File> {
-    let fd = unsafe { libc::memfd_create(c"hypr-dictate".as_ptr(), libc::MFD_CLOEXEC) };
-    ensure!(
-        fd >= 0,
-        "No se pudo crear memfd: {}",
-        std::io::Error::last_os_error()
-    );
-    // memfd_create returned a fresh descriptor; File takes sole ownership.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-struct SurfaceBuffers {
-    file: File,
-    pool: wl_shm_pool::WlShmPool,
-    buffers: [wl_buffer::WlBuffer; 2],
-    busy: [bool; 2],
-    width: i32,
-    height: i32,
-    frame_size: usize,
-}
-impl SurfaceBuffers {
-    fn new(shm: &wl_shm::WlShm, width: i32, height: i32, qh: &QueueHandle<Ui>) -> Result<Self> {
-        let frame_size = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|size| size.checked_mul(4))
-            .filter(|size| width > 0 && height > 0 && *size <= i32::MAX as usize / 2)
-            .context("Tamaño de superficie inválido")?;
-        let file = memory_file()?;
-        file.set_len((frame_size * 2) as u64)?;
-        let pool = shm.create_pool(file.as_fd(), (frame_size * 2) as i32, qh, ());
-        let buffers = std::array::from_fn(|slot| {
-            pool.create_buffer(
-                (slot * frame_size) as i32,
-                width,
-                height,
-                width * 4,
-                wl_shm::Format::Argb8888,
-                qh,
-                (),
-            )
-        });
-        Ok(Self {
-            file,
-            pool,
-            buffers,
-            busy: [false; 2],
-            width,
-            height,
-            frame_size,
-        })
-    }
-    fn available(&self) -> bool {
-        self.busy.contains(&false)
-    }
-    fn attach(&mut self, surface: &wl_surface::WlSurface, pixels: &[u8]) -> Result<bool> {
-        ensure!(pixels.len() == self.frame_size, "Tamaño de frame inválido");
-        let Some(slot) = self.busy.iter().position(|busy| !busy) else {
-            return Ok(false);
-        };
-        self.file
-            .write_all_at(pixels, (slot * self.frame_size) as u64)?;
-        self.busy[slot] = true;
-        surface.attach(Some(&self.buffers[slot]), 0, 0);
-        surface.damage_buffer(0, 0, self.width, self.height);
-        surface.commit();
-        Ok(true)
-    }
-    fn release(&mut self, buffer: &wl_buffer::WlBuffer) {
-        if let Some(slot) = self.buffers.iter().position(|item| item == buffer) {
-            self.busy[slot] = false;
-        }
-    }
-}
-impl Drop for SurfaceBuffers {
-    fn drop(&mut self) {
-        for buffer in &self.buffers {
-            buffer.destroy();
-        }
-        self.pool.destroy();
-    }
-}
-
-pub struct Ui {
-    connection: Connection,
-    compositor: Option<wl_compositor::WlCompositor>,
-    shm: Option<wl_shm::WlShm>,
-    seat: Option<wl_seat::WlSeat>,
-    shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
-    manager: Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
-    keyboard: Option<zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1>,
-    surface: Option<wl_surface::WlSurface>,
-    layer: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
-    pointer: Option<wl_pointer::WlPointer>,
-    tx: mpsc::Sender<Event>,
-    configured: bool,
-    closed: bool,
-    color: [u8; 3],
+pub struct DictateApp {
+    pub settings: Settings,
+    pub phase: Phase,
+    pub level: Arc<AtomicU32>,
+    pub capture: Option<audio::ActiveCapture>,
+    pub request_id_counter: u64,
     pub models: Vec<String>,
-    pub message: String,
-    draft: crate::settings::Settings,
-    saved: crate::settings::Settings,
-    preferences: Option<Preferences>,
-    dock_reconfigure: bool,
-    pointer_xy: (f64, f64),
-    press: Option<(f64, f64, i32)>,
-    dragged: bool,
-    tick: f64,
-    open_progress: f64,
-    pub level: f64,
-    pub microphones: Vec<crate::settings::Microphone>,
-    pub monitors: Vec<crate::settings::MonitorInfo>,
-    outputs: Vec<OutputItem>,
-    dock_buffers: Option<SurfaceBuffers>,
-    dock_dirty: bool,
-    pub dirty: bool,
-    max_x: i32,
+    pub microphones: Vec<Microphone>,
+    pub client: reqwest::blocking::Client,
+
+    pub tx: Sender<UiEvent>,
+    pub rx: Receiver<UiEvent>,
+    pub shared_shortcut: Arc<RwLock<(String, bool)>>,
+
+    // UI state
+    pub show_settings: bool,
+    pub active_tab: SettingsTab,
+    pub show_api_key: bool,
+    pub status_message: String,
+    pub catalog_status: String,
+    pub model_filter: String,
+
+    pub anim_time: f64,
+    pub open: f32,
+    pub first_frame: bool,
 }
-impl Ui {
-    fn new(
-        connection: Connection,
-        app: &App,
-        microphones: Vec<crate::settings::Microphone>,
-        monitors: Vec<crate::settings::MonitorInfo>,
-        max_x: i32,
+
+impl DictateApp {
+    pub fn new(
+        _cc: &eframe::CreationContext<'_>,
+        initial_settings: Settings,
+        shared_shortcut: Arc<RwLock<(String, bool)>>,
     ) -> Self {
-        Self {
-            connection,
-            compositor: None,
-            shm: None,
-            seat: None,
-            shell: None,
-            manager: None,
-            keyboard: None,
-            surface: None,
-            layer: None,
-            pointer: None,
-            tx: app.tx.clone(),
-            configured: false,
-            closed: false,
-            color: app.color(),
+        let (tx, rx) = channel();
+        let level = Arc::new(AtomicU32::new(0));
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+
+        let mics = audio::microphones();
+
+        let mut app = Self {
+            settings: initial_settings,
+            phase: Phase::Idle,
+            level,
+            capture: None,
+            request_id_counter: 0,
             models: Vec::new(),
-            message: "Cargando catálogo…".into(),
-            draft: app.settings.clone(),
-            saved: app.settings.clone(),
-            preferences: None,
-            dock_reconfigure: false,
-            pointer_xy: (0., 0.),
-            press: None,
-            dragged: false,
-            tick: 0.,
-            open_progress: 0.,
-            level: 0.,
-            microphones,
-            monitors,
-            outputs: Vec::new(),
-            dock_buffers: None,
-            dock_dirty: true,
-            dirty: true,
-            max_x,
+            microphones: mics,
+            client,
+            tx,
+            rx,
+            shared_shortcut,
+            show_settings: false,
+            active_tab: SettingsTab::Server,
+            show_api_key: false,
+            status_message: "Listo".into(),
+            catalog_status: String::new(),
+            model_filter: String::new(),
+            anim_time: 0.0,
+            open: 0.0,
+            first_frame: true,
+        };
+
+        app.refresh_catalog();
+        app
+    }
+
+    pub fn sync_shortcut(&self) {
+        if let Ok(mut guard) = self.shared_shortcut.write() {
+            *guard = (self.settings.shortcut.clone(), self.settings.hold_to_talk);
         }
     }
-    pub fn settings_saved(&mut self, settings: &crate::settings::Settings) {
-        self.dock_reconfigure = self.saved.monitor != settings.monitor;
-        self.saved = settings.clone();
-        self.draft = settings.clone();
+
+    pub fn refresh_catalog(&mut self) {
+        self.catalog_status = "Cargando modelos...".into();
+        let tx = self.tx.clone();
+        let client = self.client.clone();
+        let base_url = self.settings.base_url.clone();
+        let key = self.settings.api_key.clone();
+
+        thread::spawn(move || {
+            let res = (|| -> anyhow::Result<Vec<String>> {
+                let (_, endpoint) = api::api_endpoints(Some(&base_url))?;
+                api::fetch_catalog(&client, &endpoint, &key)
+            })();
+
+            let event = match res {
+                Ok(m) => UiEvent::CatalogLoaded(Ok(m)),
+                Err(e) => UiEvent::CatalogLoaded(Err(e.to_string())),
+            };
+            let _ = tx.send(event);
+        });
     }
-    pub fn server_saved(&mut self, base_url: &str) {
-        self.saved.base_url = base_url.into();
-        self.draft.base_url = base_url.into();
-        self.models.clear();
-        if let Some(preferences) = &self.preferences {
-            preferences.server_saved(base_url);
-        }
-        self.message = "Servidor guardado · cargando catálogo…".into();
-        self.dirty = true;
-    }
-    pub fn position_saved(&mut self, x: i32) {
-        self.saved.x = x;
-        self.draft.x = x;
-        if let Some(preferences) = &self.preferences {
-            preferences.position_saved(x);
-        }
-    }
-    fn save_position(&self) {
-        let _ = self.tx.send(Event::SavePosition(self.draft.x));
-    }
-    fn animate_dock(&mut self, color: [u8; 3]) {
-        self.color = color;
-        self.tick += 1.;
-        self.dock_dirty = true;
-    }
-    fn draw(&mut self, qh: &QueueHandle<Self>) -> Result<()> {
-        if self.configured && self.dock_buffers.is_none() {
-            self.dock_buffers = Some(SurfaceBuffers::new(
-                self.shm.as_ref().unwrap(),
-                176,
-                44,
-                qh,
-            )?);
-        }
-        if self.configured
-            && self.dock_dirty
-            && self
-                .dock_buffers
-                .as_ref()
-                .is_some_and(SurfaceBuffers::available)
-        {
-            let pixels = crate::paint::shell(
-                176,
-                44,
-                self.color,
-                self.open_progress,
-                self.level,
-                self.tick,
-            )?;
-            if self
-                .dock_buffers
-                .as_mut()
-                .unwrap()
-                .attach(self.surface.as_ref().unwrap(), &pixels)?
-            {
-                self.dock_dirty = false;
-            }
-        }
-        if let Some(preferences) = &self.preferences {
-            preferences.set_message(&self.message);
-        }
-        self.dirty = false;
-        Ok(())
-    }
-    fn toggle_preferences(&mut self) {
-        if let Some(preferences) = self.preferences.take()
-            && preferences.visible()
-        {
-            preferences.close();
+
+    pub fn start_dictation(&mut self) {
+        if !matches!(self.phase, Phase::Idle | Phase::Error) {
             return;
         }
-        match Preferences::new(
-            &self.saved,
-            &self.models,
-            &self.microphones,
-            &self.monitors,
-            &self.message,
-            self.tx.clone(),
-        ) {
-            Ok(preferences) => {
-                preferences.present();
-                self.preferences = Some(preferences);
-            }
-            Err(error) => {
-                self.message = format!("No se pudieron abrir los ajustes GTK4: {error}");
-                eprintln!("{}", self.message);
-            }
-        }
-    }
-    pub fn catalog_loaded(&mut self) {
-        if let Some(preferences) = &self.preferences {
-            preferences.catalog_loaded(&self.models);
-        }
-        self.message = format!(
-            "{} rutas disponibles · selecciona un modelo compatible con audio",
-            self.models.len()
-        );
-        self.dirty = true;
-    }
-    fn find_output(&self, monitor_name: &str) -> Option<&wl_output::WlOutput> {
-        if monitor_name.is_empty() {
-            return None;
-        }
-        self.outputs
-            .iter()
-            .find(|o| o.name == monitor_name)
-            .map(|o| &o.output)
-    }
-    fn update_max_x(&mut self) {
-        let width = if self.draft.monitor.is_empty() {
-            self.monitors.iter().find(|m| m.focused).map(|m| m.width)
-        } else {
-            self.monitors
-                .iter()
-                .find(|m| m.name == self.draft.monitor)
-                .map(|m| m.width)
-        }
-        .unwrap_or(1280);
-        self.max_x = width.saturating_sub(176);
-    }
-    fn setup_dock(&mut self, qh: &QueueHandle<Self>) {
-        self.dock_buffers = None;
-        self.dock_dirty = true;
-        if let Some(layer) = self.layer.take() {
-            layer.destroy();
-        }
-        if let Some(surface) = self.surface.take() {
-            surface.destroy();
-        }
-        self.configured = false;
-        let surface = self.compositor.as_ref().unwrap().create_surface(qh, ());
-        let target_output = self.find_output(&self.draft.monitor);
-        let layer = self.shell.as_ref().unwrap().get_layer_surface(
-            &surface,
-            target_output,
-            Layer::Overlay,
-            "hypr-dictate".into(),
-            qh,
-            (),
-        );
-        layer.set_size(176, 44);
-        layer.set_anchor(Anchor::Bottom | Anchor::Left);
-        self.update_max_x();
-        self.draft.x = self.draft.x.clamp(0, self.max_x);
-        layer.set_margin(0, 0, 0, self.draft.x);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.set_exclusive_zone(0);
-        surface.commit();
-        self.surface = Some(surface);
-        self.layer = Some(layer);
-        self.dirty = true;
-    }
-    pub fn type_text(&mut self, text: &str, address: &str) -> Result<()> {
-        let cleaned = hypr_dictate::sanitize_plain_text(text);
-        if cleaned.is_empty() {
-            return Ok(());
-        }
-        // Wait for physical modifiers (CTRL/ALT/SHIFT/SUPER) to be released so the target app
-        // never sees Ctrl+key or Alt+key combinations while typing.
-        for _ in 0..100 {
-            if !crate::shortcut::any_modifier_held() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(15));
-        }
-        let keyboard = self.keyboard.as_ref().unwrap();
-        let all_chars: Vec<char> = cleaned.chars().collect();
-        let mut cursor = 0;
-        while cursor < all_chars.len() {
-            ensure!(
-                crate::active_address()? == address,
-                "Cambió el foco durante la inserción; inserción detenida"
-            );
-            let mut map = BTreeMap::new();
-            let mut names = String::new();
-            let mut symbols = String::new();
-            let mut end = cursor;
-            while end < all_chars.len() {
-                let ch = all_chars[end];
-                if !map.contains_key(&ch) {
-                    if map.len() == hypr_dictate::SAFE_EVDEV_KEYS.len() {
-                        break;
-                    }
-                    let slot = map.len();
-                    let evdev = hypr_dictate::SAFE_EVDEV_KEYS[slot];
-                    let xkb = evdev + 8;
-                    map.insert(ch, evdev);
-                    names.push_str(&format!("<K{slot}> = {xkb};\n"));
-                    symbols.push_str(&format!("key <K{slot}> {{ [ U{:04X} ] }};\n", ch as u32));
-                }
-                end += 1;
-            }
-            let keymap = format!(
-                "xkb_keymap {{ xkb_keycodes \"dictate\" {{ minimum = 8; maximum = 255; {names} }}; xkb_types \"dictate\" {{ type \"ONE_LEVEL\" {{ modifiers = None; level_name[Level1] = \"Any\"; }}; }}; xkb_compatibility \"dictate\" {{}}; xkb_symbols \"dictate\" {{ {symbols} }}; }};\0"
-            );
-            let mut file = memory_file()?;
-            file.write_all(keymap.as_bytes())?;
-            file.seek(SeekFrom::Start(0))?;
-            keyboard.keymap(1, file.as_fd(), keymap.len() as u32);
-            keyboard.modifiers(0, 0, 0, 0);
-            self.connection.flush()?;
-            std::thread::sleep(Duration::from_millis(6));
-            for ch in &all_chars[cursor..end] {
-                let code = map[ch];
-                keyboard.key(0, code, 1);
-                keyboard.key(0, code, 0);
-            }
-            self.connection.flush()?;
-            std::thread::sleep(Duration::from_millis(8));
-            cursor = end;
-        }
-        Ok(())
-    }
-}
-impl Dispatch<wl_registry::WlRegistry, ()> for Ui {
-    fn event(
-        state: &mut Self,
-        registry: &wl_registry::WlRegistry,
-        event: wl_registry::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            match interface.as_str() {
-                "wl_compositor" => {
-                    state.compositor = Some(registry.bind(name, version.min(4), qh, ()))
-                }
-                "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
-                "wl_seat" if state.seat.is_none() => {
-                    state.seat = Some(registry.bind(name, version.min(7), qh, ()))
-                }
-                "zwlr_layer_shell_v1" => {
-                    state.shell = Some(registry.bind(name, version.min(4), qh, ()))
-                }
-                "wl_output" => {
-                    let output: wl_output::WlOutput = registry.bind(name, version.min(4), qh, ());
-                    state.outputs.push(OutputItem {
-                        name: String::new(),
-                        output,
-                    });
-                }
-                "zwp_virtual_keyboard_manager_v1" => {
-                    state.manager = Some(registry.bind(name, 1, qh, ()))
-                }
-                _ => {}
-            }
-        }
-    }
-}
-impl Dispatch<wl_seat::WlSeat, ()> for Ui {
-    fn event(
-        state: &mut Self,
-        seat: &wl_seat::WlSeat,
-        event: wl_seat::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        if let wl_seat::Event::Capabilities {
-            capabilities: wayland_client::WEnum::Value(caps),
-        } = event
-            && caps.contains(wl_seat::Capability::Pointer)
-            && state.pointer.is_none()
-        {
-            state.pointer = Some(seat.get_pointer(qh, ()));
-        }
-    }
-}
-impl Dispatch<wl_pointer::WlPointer, ()> for Ui {
-    fn event(
-        state: &mut Self,
-        _: &wl_pointer::WlPointer,
-        event: wl_pointer::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        use wayland_client::WEnum::Value;
-        match event {
-            wl_pointer::Event::Enter {
-                surface_x,
-                surface_y,
-                ..
-            } => {
-                state.pointer_xy = (surface_x, surface_y);
-            }
-            wl_pointer::Event::Leave { .. } => {
-                state.press = None;
-            }
-            wl_pointer::Event::Motion {
-                surface_x,
-                surface_y,
-                ..
-            } => {
-                state.pointer_xy = (surface_x, surface_y);
-                if let Some((x, _, origin)) = state.press {
-                    let delta = surface_x - x;
-                    let origin = if state.dragged { state.draft.x } else { origin };
-                    if delta.abs() > 6. || state.dragged {
-                        state.dragged = true;
-                        state.draft.x = (origin + delta as i32).clamp(0, state.max_x);
-                        state
-                            .layer
-                            .as_ref()
-                            .unwrap()
-                            .set_margin(0, 0, 0, state.draft.x);
-                        state.surface.as_ref().unwrap().commit();
-                    }
-                }
-            }
-            wl_pointer::Event::Button {
-                button: 273,
-                state: Value(wl_pointer::ButtonState::Pressed),
-                ..
-            } => state.toggle_preferences(),
-            wl_pointer::Event::Button {
-                button: 272,
-                state: Value(wl_pointer::ButtonState::Pressed),
-                ..
-            } => {
-                state.press = Some((state.pointer_xy.0, state.pointer_xy.1, state.draft.x));
-                state.dragged = false;
-            }
-            wl_pointer::Event::Button {
-                button: 272,
-                state: Value(wl_pointer::ButtonState::Released),
-                ..
-            } if state.press.take().is_some() => {
-                if state.dragged {
-                    state.save_position();
-                } else {
-                    let _ = state.tx.send(Event::Command("toggle".into()));
-                }
-            }
-            _ => {}
-        }
-        if (state.dirty || state.dock_dirty)
-            && let Err(error) = state.draw(qh)
-        {
-            state.message = error.to_string();
-        }
-    }
-}
-impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for Ui {
-    fn event(
-        state: &mut Self,
-        layer: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-        event: zwlr_layer_surface_v1::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        match event {
-            zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
-                layer.ack_configure(serial);
-                state.configured = true;
-                state.dock_dirty = true;
-                if let Err(error) = state.draw(qh) {
-                    eprintln!("No se pudo dibujar: {error}");
-                    state.closed = true;
-                }
-            }
-            zwlr_layer_surface_v1::Event::Closed => state.closed = true,
-            _ => {}
-        }
-    }
-}
-impl Dispatch<wl_buffer::WlBuffer, ()> for Ui {
-    fn event(
-        state: &mut Self,
-        buffer: &wl_buffer::WlBuffer,
-        event: wl_buffer::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_buffer::Event::Release = event
-            && let Some(buffers) = &mut state.dock_buffers
-        {
-            buffers.release(buffer);
-        }
-    }
-}
-impl Dispatch<wl_output::WlOutput, ()> for Ui {
-    fn event(
-        state: &mut Self,
-        output: &wl_output::WlOutput,
-        event: wl_output::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_output::Event::Name { name } = event
-            && let Some(item) = state.outputs.iter_mut().find(|o| &o.output == output)
-        {
-            item.name = name;
-        }
-    }
-}
-delegate_noop!(Ui: ignore wl_compositor::WlCompositor);
-delegate_noop!(Ui: ignore wl_surface::WlSurface);
-delegate_noop!(Ui: ignore wl_shm::WlShm);
-delegate_noop!(Ui: ignore wl_shm_pool::WlShmPool);
-delegate_noop!(Ui: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
-delegate_noop!(Ui: ignore zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1);
-delegate_noop!(Ui: ignore zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1);
 
-fn monitor_width() -> Option<i32> {
-    let value: serde_json::Value =
-        serde_json::from_slice(&crate::hypr(&["-j", "monitors"]).ok()?).ok()?;
-    let monitor = value.as_array()?.iter().find(|m| m["focused"] == true)?;
-    Some((monitor["width"].as_f64()? / monitor["scale"].as_f64().unwrap_or(1.)) as i32)
-}
-pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
-    let connection = Connection::connect_to_env().context("No se pudo conectar con Wayland")?;
-    let mut queue = connection.new_event_queue();
-    let qh = queue.handle();
-    // Microphone detection is a cheap local pw-dump call, unlike the model
-    // catalog which needs a network round trip, so it is resolved up front
-    // and never blocks startup if PipeWire's CLI tooling has an issue.
-    let microphones = crate::settings::microphones().unwrap_or_default();
-    let monitors = crate::settings::monitors();
-    let mut ui = Ui::new(
-        connection.clone(),
-        &app,
-        microphones,
-        monitors,
-        monitor_width().unwrap_or(1280).saturating_sub(176),
-    );
-    connection.display().get_registry(&qh, ());
-    queue.roundtrip(&mut ui)?;
-    queue.roundtrip(&mut ui)?;
-    ensure!(
-        ui.compositor.is_some()
-            && ui.shm.is_some()
-            && ui.seat.is_some()
-            && ui.shell.is_some()
-            && ui.manager.is_some(),
-        "El compositor no ofrece los protocolos Wayland necesarios"
-    );
-    ui.keyboard = Some(ui.manager.as_ref().unwrap().create_virtual_keyboard(
-        ui.seat.as_ref().unwrap(),
-        &qh,
-        (),
-    ));
-    ui.setup_dock(&qh);
-    queue.roundtrip(&mut ui)?;
-    while !ui.closed {
-        queue.dispatch_pending(&mut ui)?;
-        let context = gtk4::glib::MainContext::default();
-        for _ in 0..64 {
-            if !context.pending() {
-                break;
-            }
-            context.iteration(false);
-        }
-        if ui.preferences.as_ref().is_some_and(|p| !p.visible()) {
-            ui.preferences = None;
-        }
-        while let Ok(event) = rx.try_recv() {
-            app.event(event, &mut ui);
-            ui.dirty = true;
-        }
-        if ui.dock_reconfigure {
-            ui.setup_dock(&qh);
-            ui.dock_reconfigure = false;
-        }
-        let color = app.color();
-        let active = matches!(
-            app.phase,
-            hypr_dictate::Phase::Recording(_) | hypr_dictate::Phase::Processing(_)
-        );
-        let target = if active { 1. } else { 0. };
-        if (ui.open_progress - target).abs() > 0.01 {
-            ui.open_progress = (ui.open_progress
-                + if target > ui.open_progress {
-                    0.14
-                } else {
-                    -0.1
-                })
-            .clamp(0., 1.);
-            ui.dock_dirty = true;
-        }
-        let animating = active || ui.open_progress > 0.01;
-        if matches!(app.phase, hypr_dictate::Phase::Processing(_)) {
-            ui.level = -1.;
-        } else {
-            let peak = app.level.load(std::sync::atomic::Ordering::Relaxed) as f64;
-            // Clean noise floor filter: ignore quiet room ambient noise under 100
-            // and use square root scaling for vibrant, responsive voice dynamics
-            let normalized = ((peak - 100.).max(0.) / 2400.).min(1.);
-            let raw = normalized.sqrt();
-            if raw > ui.level {
-                ui.level = raw;
+        if self.settings.model.trim().is_empty() {
+            if let Some(first) = self.models.first() {
+                self.settings.model = first.clone();
             } else {
-                ui.level = (ui.level * 0.86 - 0.008).max(0.);
+                self.status_message = "Selecciona un modelo en Ajustes".into();
+                self.phase = Phase::Error;
+                return;
             }
         }
-        if animating || color != ui.color {
-            ui.animate_dock(color);
-        }
-        if (ui.dock_dirty || ui.dirty) && ui.configured {
-            ui.draw(&qh)?;
-        }
-        connection.flush()?;
-        if let Some(guard) = queue.prepare_read() {
-            let mut fd = libc::pollfd {
-                fd: std::os::fd::AsRawFd::as_raw_fd(&connection.backend().poll_fd()),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let timeout = if animating || ui.preferences.is_some() {
-                8
-            } else {
-                100
-            };
-            let ready = unsafe { libc::poll(&mut fd, 1, timeout) };
-            if ready > 0 {
-                if let Err(error) = guard.read()
-                    && !hypr_dictate::transient_wayland_error(&error)
-                {
-                    return Err(error.into());
-                }
-            } else {
-                drop(guard);
-            }
-        }
-    }
-    Ok(())
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::settings::{Microphone, MonitorInfo};
-    use wayland_client::Proxy;
-
-    fn ui() -> (Ui, std::os::unix::net::UnixStream) {
-        let (socket, server) = std::os::unix::net::UnixStream::pair().unwrap();
-        let connection = Connection::from_socket(socket).unwrap();
-        let mut app = crate::tests::app(hypr_dictate::Phase::Idle);
-        app.settings = crate::settings::Settings {
-            model: "account/model".into(),
-            shortcut: "SUPER + F9".into(),
-            microphone: "saved-mic".into(),
-            monitor: "saved-monitor".into(),
-            ..Default::default()
+        let address = match input::active_window() {
+            Ok(addr) => addr,
+            Err(e) => {
+                self.status_message = format!("Error: {e}");
+                self.phase = Phase::Error;
+                return;
+            }
         };
-        let mut ui = Ui::new(
-            connection,
-            &app,
-            vec![Microphone {
-                name: "saved-mic".into(),
-                description: "Mic".into(),
-            }],
-            vec![MonitorInfo {
-                name: "saved-monitor".into(),
-                description: "Monitor".into(),
-                width: 1920,
-                focused: true,
-            }],
-            1744,
-        );
-        ui.models = vec!["account/model".into()];
-        (ui, server)
-    }
 
-    fn shm_and_surface(ui: &Ui) -> (wl_shm::WlShm, wl_surface::WlSurface, QueueHandle<Ui>) {
-        let queue = ui.connection.new_event_queue::<Ui>();
-        let qh = queue.handle();
-        let registry = ui.connection.display().get_registry(&qh, ());
-        let shm = registry.bind::<wl_shm::WlShm, _, _>(1, 1, &qh, ());
-        let compositor = registry.bind::<wl_compositor::WlCompositor, _, _>(2, 4, &qh, ());
-        (shm, compositor.create_surface(&qh, ()), qh)
-    }
-
-    #[test]
-    fn shared_files_are_memory_backed_and_close_on_exec() {
-        use std::os::fd::AsRawFd;
-        let file = memory_file().unwrap();
-        let target = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).unwrap();
-        assert!(
-            target.to_string_lossy().starts_with("/memfd:"),
-            "{target:?}"
-        );
-        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
-        assert_ne!(flags & libc::FD_CLOEXEC, 0);
-    }
-
-    #[test]
-    fn surface_reuses_only_released_buffers_and_never_overwrites_busy_pixels() {
-        let (ui, _server) = ui();
-        let (shm, surface, qh) = shm_and_surface(&ui);
-        let mut buffers = SurfaceBuffers::new(&shm, 2, 2, &qh).unwrap();
-        let ids = buffers.buffers.each_ref().map(|buffer| buffer.id());
-        assert!(buffers.attach(&surface, &[1; 16]).unwrap());
-        assert!(buffers.attach(&surface, &[2; 16]).unwrap());
-        assert!(!buffers.available());
-        assert!(!buffers.attach(&surface, &[3; 16]).unwrap());
-        let mut pixels = [0; 32];
-        buffers.file.read_exact_at(&mut pixels, 0).unwrap();
-        assert_eq!(&pixels[..16], &[1; 16]);
-        assert_eq!(&pixels[16..], &[2; 16]);
-        let first = buffers.buffers[0].clone();
-        buffers.release(&first);
-        assert!(buffers.available());
-        assert!(buffers.attach(&surface, &[3; 16]).unwrap());
-        buffers.file.read_exact_at(&mut pixels, 0).unwrap();
-        assert_eq!(&pixels[..16], &[3; 16]);
-        assert_eq!(&pixels[16..], &[2; 16]);
-        assert_eq!(buffers.buffers.each_ref().map(|buffer| buffer.id()), ids);
-        assert_eq!(buffers.file.metadata().unwrap().len(), 32);
-    }
-
-    #[test]
-    fn invalid_frames_and_old_releases_cannot_corrupt_a_pool() {
-        let (ui, _server) = ui();
-        let (shm, surface, qh) = shm_and_surface(&ui);
-        assert!(SurfaceBuffers::new(&shm, 0, 2, &qh).is_err());
-        assert!(SurfaceBuffers::new(&shm, i32::MAX, 2, &qh).is_err());
-        let old = SurfaceBuffers::new(&shm, 2, 2, &qh).unwrap();
-        let old_buffer = old.buffers[0].clone();
-        let mut new = SurfaceBuffers::new(&shm, 2, 2, &qh).unwrap();
-        new.attach(&surface, &[7; 16]).unwrap();
-        assert!(new.attach(&surface, &[0; 15]).is_err());
-        new.release(&old_buffer);
-        assert_eq!(new.busy, [true, false]);
-        let mut pixels = [0; 16];
-        new.file.read_exact_at(&mut pixels, 0).unwrap();
-        assert_eq!(pixels, [7; 16]);
-    }
-
-    #[test]
-    fn dragging_emits_only_position_even_without_catalog() {
-        let (mut ui, _server) = ui();
-        let (tx, rx) = mpsc::channel();
-        ui.tx = tx;
-        ui.models.clear();
-        ui.draft.x = 456;
-        ui.draft.shortcut = "CTRL + ALT + D".into();
-        ui.draft.model = "unsaved/model".into();
-        ui.draft.prompt = "unsaved prompt".into();
-        let draft = format!("{:?}", ui.draft);
-        ui.save_position();
-        assert!(matches!(rx.try_recv().unwrap(), Event::SavePosition(456)));
-        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
-        assert_eq!(format!("{:?}", ui.draft), draft);
-    }
-
-    #[test]
-    fn stale_catalog_success_and_failure_do_not_change_ui_or_phase() {
-        let (mut ui, _server) = ui();
-        let mut app = crate::tests::app(hypr_dictate::Phase::Idle);
-        app.catalog_generation = 3;
-        let models = ui.models.clone();
-        let message = ui.message.clone();
-        for result in [
-            Ok(vec!["old/model".into()]),
-            Err(anyhow::anyhow!("old failure")),
-        ] {
-            app.event(
-                Event::Catalog(app.settings.base_url.clone(), 1, result),
-                &mut ui,
-            );
-            assert_eq!(ui.models, models);
-            assert_eq!(ui.message, message);
-            assert_eq!(app.phase, hypr_dictate::Phase::Idle);
+        match audio::start_recording(&self.settings.microphone, self.level.clone()) {
+            Ok(capture) => {
+                self.capture = Some(capture);
+                self.phase = Phase::Recording(address);
+                self.status_message = "Grabando...".into();
+            }
+            Err(e) => {
+                self.status_message = format!("Error microfono: {e}");
+                self.phase = Phase::Error;
+            }
         }
-        app.event(
-            Event::Catalog(
-                app.settings.base_url.clone(),
-                3,
-                Ok(vec!["new/model".into()]),
-            ),
-            &mut ui,
-        );
-        assert_eq!(ui.models, ["new/model"]);
     }
 
-    #[test]
-    fn settings_apply_reconfigures_dock_only_after_success_and_preserves_server() {
-        let (mut ui, _server) = ui();
-        let mut settings = ui.saved.clone();
-        settings.monitor = "other".into();
-        ui.settings_saved(&settings);
-        assert!(ui.dock_reconfigure);
-        assert_eq!(ui.saved.monitor, "other");
-        ui.server_saved("https://new.example");
-        assert_eq!(ui.saved.monitor, "other");
-        assert_eq!(ui.saved.base_url, "https://new.example");
-        assert!(ui.models.is_empty());
+    pub fn stop_dictation(&mut self) {
+        self.request_id_counter += 1;
+        let req_id = self.request_id_counter;
+
+        let Some(address) = self.phase.stop(req_id) else {
+            return;
+        };
+
+        let Some(capture) = self.capture.take() else {
+            self.phase = Phase::Idle;
+            return;
+        };
+
+        self.status_message = "Transcribiendo...".into();
+
+        let pcm = match capture.stop() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.status_message = format!("Error audio: {e}");
+                self.phase = Phase::Error;
+                return;
+            }
+        };
+
+        if !capture_valid(&pcm) {
+            self.status_message = "Audio invalido".into();
+            self.phase = Phase::Error;
+            return;
+        }
+
+        let tx = self.tx.clone();
+        let client = self.client.clone();
+        let base_url = self.settings.base_url.clone();
+        let key = self.settings.api_key.clone();
+        let model = self.settings.model.clone();
+        let temp = self.settings.temperature;
+        let prompt = self.settings.prompt.clone();
+
+        thread::spawn(move || {
+            let res = (|| -> anyhow::Result<String> {
+                let (endpoint, _) = api::api_endpoints(Some(&base_url))?;
+                api::send_transcription(&client, &endpoint, &key, &model, temp, &prompt, &pcm)
+            })();
+
+            let _ = tx.send(UiEvent::TranscriptionFinished {
+                request_id: req_id,
+                address,
+                result: res.map_err(|e| e.to_string()),
+            });
+        });
+    }
+
+    pub fn cancel_dictation(&mut self) {
+        if let Some(capture) = self.capture.take() {
+            let _ = capture.stop();
+        }
+        self.phase = Phase::Idle;
+        self.level.store(0, Ordering::Relaxed);
+        self.status_message = "Cancelado".into();
+    }
+
+    pub fn toggle_dictation(&mut self) {
+        match self.phase {
+            Phase::Idle | Phase::Error => self.start_dictation(),
+            Phase::Recording(_) => self.stop_dictation(),
+            Phase::Processing(_) => self.cancel_dictation(),
+        }
+    }
+
+    pub fn process_events(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                UiEvent::ShortcutDown => {
+                    match self.phase {
+                        Phase::Idle | Phase::Error => {
+                            self.start_dictation();
+                        }
+                        Phase::Processing(_) | Phase::Recording(_) => {
+                            // "y si se vuelve a presionar el atajo, es para cancelar..."
+                            self.cancel_dictation();
+                        }
+                    }
+                }
+                UiEvent::ShortcutUp => {
+                    if matches!(self.phase, Phase::Recording(_)) {
+                        self.stop_dictation();
+                    }
+                }
+                UiEvent::IpcCommand(cmd) => match cmd.as_str() {
+                    "start" => {
+                        if matches!(self.phase, Phase::Idle | Phase::Error) {
+                            self.start_dictation();
+                        } else if matches!(self.phase, Phase::Processing(_)) {
+                            self.cancel_dictation();
+                        } else if matches!(self.phase, Phase::Recording(_)) {
+                            self.stop_dictation();
+                        }
+                    }
+                    "stop" => {
+                        if matches!(self.phase, Phase::Recording(_)) {
+                            self.stop_dictation();
+                        }
+                    }
+                    "cancel" => self.cancel_dictation(),
+                    "toggle" => self.toggle_dictation(),
+                    "reset" | "reload" => {
+                        self.cancel_dictation();
+                        self.status_message = "Reiniciado".into();
+                    }
+                    "settings" => {
+                        self.show_settings = !self.show_settings;
+                        self.first_frame = true;
+                    }
+                    _ => {}
+                },
+                UiEvent::CatalogLoaded(result) => match result {
+                    Ok(models) => {
+                        self.models = models;
+                        self.catalog_status = format!("OK: {} modelos disponibles", self.models.len());
+                        if self.settings.model.is_empty() && !self.models.is_empty() {
+                            self.settings.model = self.models[0].clone();
+                        }
+                        if matches!(self.phase, Phase::Error) && self.status_message.contains("modelo") {
+                            self.phase = Phase::Idle;
+                            self.status_message = "Listo".into();
+                        }
+                    }
+                    Err(err) => {
+                        self.catalog_status = format!("Error al conectar: {err}");
+                    }
+                },
+                UiEvent::TranscriptionFinished {
+                    request_id,
+                    address,
+                    result,
+                } => {
+                    if self.phase != Phase::Processing(request_id) {
+                        return;
+                    }
+
+                    match result {
+                        Ok(text) => {
+                            let clean = sanitize_plain_text(&text);
+                            if !clean.is_empty() {
+                                let _ = input::restore_focus(&address);
+                                thread::sleep(Duration::from_millis(60));
+                                if let Err(e) = input::type_text(&clean) {
+                                    self.status_message = format!("Error escritura: {e}");
+                                    self.phase = Phase::Error;
+                                    return;
+                                }
+                            }
+                            self.phase = Phase::Idle;
+                            self.status_message = "Listo".into();
+                        }
+                        Err(err) => {
+                            self.status_message = format!("Error: {err}");
+                            self.phase = Phase::Error;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn state_color(&self) -> Color32 {
+        match self.phase {
+            Phase::Idle => Color32::from_rgb(55, 170, 130),       // Emerald Teal
+            Phase::Recording(_) => Color32::from_rgb(235, 65, 75), // Ruby Red
+            Phase::Processing(_) => Color32::from_rgb(230, 170, 40), // Amber Gold
+            Phase::Error => Color32::from_rgb(160, 75, 210),      // Purple
+        }
+    }
+
+    pub fn reposition_window(&self, ctx: &egui::Context) {
+        let screen_w = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(0) } as f32;
+        let screen_h = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(1) } as f32;
+
+        let (w, h) = if self.show_settings {
+            (460.0, 520.0)
+        } else {
+            (176.0, 44.0)
+        };
+
+        let (x, y) = match self.settings.position.as_str() {
+            "Arriba" => (
+                ((screen_w - w) / 2.0).max(10.0),
+                38.0,
+            ),
+            "Izquierda" => (
+                0.0,
+                ((screen_h - h) / 2.0).max(10.0),
+            ),
+            "Derecha" => (
+                (screen_w - w).max(10.0),
+                ((screen_h - h) / 2.0).max(10.0),
+            ),
+            _ => (
+                // "Abajo"
+                ((screen_w - w) / 2.0).max(10.0),
+                (screen_h - h).max(0.0),
+            ),
+        };
+
+        let title: Vec<u16> = "hypr-dictate\0".encode_utf16().collect();
+        let hwnd = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
+                std::ptr::null(),
+                title.as_ptr(),
+            )
+        };
+        if !hwnd.is_null() {
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
+                    SWP_FRAMECHANGED, SWP_SHOWWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                };
+                let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                SetWindowLongPtrW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    ex | (WS_EX_TOOLWINDOW | WS_EX_TOPMOST) as isize,
+                );
+                SetWindowPos(
+                    hwnd,
+                    -1isize as windows_sys::Win32::Foundation::HWND, // HWND_TOPMOST
+                    x as i32,
+                    y as i32,
+                    w as i32,
+                    h as i32,
+                    SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+                );
+            }
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(w, h)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(x, y)));
+    }
+}
+
+impl eframe::App for DictateApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.process_events();
+        let ctx = ui.ctx().clone();
+        let dt = ctx.input(|i| i.stable_dt);
+        self.anim_time += dt as f64;
+
+        // Smoothly animate carapace expansion/collapse
+        let target_open = if matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)) {
+            1.0
+        } else {
+            0.0
+        };
+        if self.open < target_open {
+            self.open = (self.open + dt * 8.0).min(target_open);
+        } else if self.open > target_open {
+            self.open = (self.open - dt * 6.0).max(target_open);
+        }
+
+        if self.first_frame {
+            self.reposition_window(&ctx);
+            self.first_frame = false;
+        }
+
+        // Cancel with Escape key at any time while recording or processing
+        if matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)) {
+            let esc = (unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x1B) } as u16 & 0x8000) != 0;
+            if esc {
+                self.cancel_dictation();
+            }
+        }
+
+        // Keep animated redraw active when recording, processing, or easing
+        if matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)) || self.open > 0.001 {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
+        ui.style_mut().visuals.window_fill = Color32::TRANSPARENT;
+        ui.style_mut().visuals.panel_fill = Color32::TRANSPARENT;
+
+        if self.show_settings {
+            render_settings_window(self, ui, &ctx);
+        } else {
+            render_original_carapace(self, ui, &ctx);
+        }
+    }
+}
+
+fn render_original_carapace(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui::Context) {
+    let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(176.0, 44.0));
+    let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+    if response.dragged() {
+        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    if response.clicked() {
+        app.toggle_dictation();
+    }
+    if response.secondary_clicked() {
+        if matches!(app.phase, Phase::Recording(_) | Phase::Processing(_)) {
+            app.cancel_dictation();
+        } else {
+            app.show_settings = true;
+            app.reposition_window(ctx);
+        }
+    }
+
+    let level_f = if matches!(app.phase, Phase::Processing(_)) {
+        -1.0
+    } else {
+        (app.level.load(Ordering::Relaxed) as f32 / 32768.0).clamp(0.0, 1.0)
+    };
+
+    let painter = ui.painter_at(rect);
+    paint::draw_carapace(
+        &painter,
+        176.0,
+        44.0,
+        app.state_color(),
+        app.open,
+        level_f,
+        app.anim_time as f32,
+        &app.settings.position,
+    );
+}
+
+fn render_settings_window(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui::Context) {
+    let full_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(460.0, 520.0));
+    let painter = ui.painter_at(full_rect);
+
+    painter.rect_filled(full_rect, 14.0, Color32::from_rgb(16, 20, 28));
+    painter.rect_stroke(full_rect, 14.0, Stroke::new(1.5, Color32::from_rgb(45, 55, 75)), egui::StrokeKind::Outside);
+
+    egui::Frame::new().inner_margin(14.0).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(14.0, 14.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot_rect.center(), 4.5, app.state_color());
+
+            ui.heading(egui::RichText::new("Ajustes - HyprDictate").size(16.0).strong().color(Color32::from_rgb(230, 235, 245)));
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(egui::RichText::new(" X ").strong().color(Color32::from_rgb(220, 100, 100))).clicked() {
+                    app.show_settings = false;
+                    app.reposition_window(ctx);
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            let is_server = app.active_tab == SettingsTab::Server;
+            let s_col = if is_server { Color32::from_rgb(55, 175, 135) } else { Color32::from_rgb(140, 150, 165) };
+            if ui.button(egui::RichText::new("Servidor y API Key").color(s_col).strong()).clicked() {
+                app.active_tab = SettingsTab::Server;
+            }
+
+            let is_gen = app.active_tab == SettingsTab::General;
+            let g_col = if is_gen { Color32::from_rgb(55, 175, 135) } else { Color32::from_rgb(140, 150, 165) };
+            if ui.button(egui::RichText::new("General e IA").color(g_col).strong()).clicked() {
+                app.active_tab = SettingsTab::General;
+            }
+        });
+
+        ui.separator();
+        ui.add_space(6.0);
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            match app.active_tab {
+                SettingsTab::Server => render_server_tab(app, ui),
+                SettingsTab::General => render_general_tab(app, ui),
+            }
+        });
+    });
+}
+
+fn render_server_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new("Configuracion de CLIProxyAPI / Servidor OpenAI").strong().color(Color32::from_rgb(210, 220, 235)));
+    ui.add_space(6.0);
+
+    ui.label(egui::RichText::new("URL Base del Servidor:").color(Color32::from_rgb(170, 180, 195)));
+    ui.text_edit_singleline(&mut app.settings.base_url);
+    ui.label(egui::RichText::new("Ejemplo: http://127.0.0.1:8317 o https://cpamc.sistemasias.com.ar").size(11.0).color(Color32::from_rgb(120, 130, 145)));
+
+    ui.add_space(10.0);
+
+    ui.label(egui::RichText::new("Clave API (API Key):").color(Color32::from_rgb(170, 180, 195)));
+    ui.horizontal(|ui| {
+        if app.show_api_key {
+            ui.add(egui::TextEdit::singleline(&mut app.settings.api_key).desired_width(310.0));
+        } else {
+            ui.add(
+                egui::TextEdit::singleline(&mut app.settings.api_key)
+                    .password(true)
+                    .desired_width(310.0),
+            );
+        }
+
+        if ui
+            .button(if app.show_api_key { "Ocultar" } else { "Mostrar" })
+            .clicked()
+        {
+            app.show_api_key = !app.show_api_key;
+        }
+    });
+    ui.label(egui::RichText::new("Introduce aqui tu API Key. Se guardara permanentemente.").size(11.0).color(Color32::from_rgb(120, 130, 145)));
+
+    ui.add_space(14.0);
+
+    if ui
+        .button(egui::RichText::new("Guardar servidor y recargar catalogo").strong().color(Color32::from_rgb(240, 245, 255)))
+        .clicked()
+    {
+        if let Err(e) = app.settings.save() {
+            app.status_message = format!("Error al guardar: {e}");
+        } else {
+            app.status_message = "Servidor y API Key guardados".into();
+            app.refresh_catalog();
+        }
+    }
+
+    ui.add_space(8.0);
+    if !app.catalog_status.is_empty() {
+        let is_ok = app.catalog_status.starts_with("OK");
+        let col = if is_ok {
+            Color32::from_rgb(70, 210, 130)
+        } else {
+            Color32::from_rgb(235, 80, 80)
+        };
+        ui.label(egui::RichText::new(&app.catalog_status).color(col).size(12.0));
+    }
+}
+
+fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new("Opciones Generales").strong().color(Color32::from_rgb(210, 220, 235)));
+    ui.add_space(6.0);
+
+    // Dock Position Selector
+    ui.label(egui::RichText::new("Posicion del Dock en pantalla:").color(Color32::from_rgb(170, 180, 195)));
+    let old_pos = app.settings.position.clone();
+    egui::ComboBox::from_label("Borde")
+        .selected_text(&app.settings.position)
+        .show_ui(ui, |ui| {
+            for &pos in &settings::DOCK_POSITIONS {
+                ui.selectable_value(&mut app.settings.position, pos.into(), pos);
+            }
+        });
+
+    if old_pos != app.settings.position {
+        app.reposition_window(ui.ctx());
+    }
+
+    ui.add_space(8.0);
+
+    // Model Selector
+    ui.label(egui::RichText::new("Modelo de Transcripcion:").color(Color32::from_rgb(170, 180, 195)));
+    ui.horizontal(|ui| {
+        ui.label("Filtrar:");
+        ui.text_edit_singleline(&mut app.model_filter);
+    });
+
+    let filtered_models: Vec<&String> = app
+        .models
+        .iter()
+        .filter(|m| {
+            app.model_filter.is_empty()
+                || m.to_lowercase().contains(&app.model_filter.to_lowercase())
+        })
+        .collect();
+
+    egui::ComboBox::from_label("Modelo")
+        .selected_text(if app.settings.model.is_empty() {
+            "Ninguno seleccionado"
+        } else {
+            &app.settings.model
+        })
+        .show_ui(ui, |ui| {
+            for m in filtered_models {
+                ui.selectable_value(&mut app.settings.model, m.clone(), m);
+            }
+        });
+
+    ui.add_space(8.0);
+
+    // Microphone Selector
+    ui.label(egui::RichText::new("Microfono de entrada:").color(Color32::from_rgb(170, 180, 195)));
+    egui::ComboBox::from_label("Dispositivo")
+        .selected_text(if app.settings.microphone.is_empty() {
+            "Predeterminado del sistema"
+        } else {
+            &app.settings.microphone
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut app.settings.microphone,
+                String::new(),
+                "Predeterminado del sistema",
+            );
+            for mic in &app.microphones {
+                ui.selectable_value(
+                    &mut app.settings.microphone,
+                    mic.name.clone(),
+                    &mic.description,
+                );
+            }
+        });
+
+    ui.add_space(8.0);
+
+    // Shortcut Selector
+    ui.label(egui::RichText::new("Atajo de Teclado:").color(Color32::from_rgb(170, 180, 195)));
+    let old_sc = app.settings.shortcut.clone();
+    egui::ComboBox::from_label("Atajo")
+        .selected_text(if app.settings.shortcut.is_empty() {
+            "Desactivado"
+        } else {
+            &app.settings.shortcut
+        })
+        .show_ui(ui, |ui| {
+            for &sc in &shortcut::PRESET_SHORTCUTS {
+                let label = if sc.is_empty() { "Desactivado" } else { sc };
+                ui.selectable_value(&mut app.settings.shortcut, sc.into(), label);
+            }
+        });
+
+    if old_sc != app.settings.shortcut {
+        app.sync_shortcut();
+    }
+
+    ui.small("Presiona y manten pulsado para hablar. Al soltar transcribe. Presiona de nuevo para cancelar.");
+
+    ui.add_space(6.0);
+
+    // Autostart with Windows
+    if ui
+        .checkbox(
+            &mut app.settings.autostart,
+            "Iniciar automaticamente con Windows",
+        )
+        .changed()
+    {
+        let _ = crate::autostart::set_autostart(app.settings.autostart);
+    }
+
+    ui.add_space(8.0);
+
+    // Temperature
+    ui.label(egui::RichText::new("Temperatura de IA:").color(Color32::from_rgb(170, 180, 195)));
+    ui.add(egui::Slider::new(&mut app.settings.temperature, 0.0..=1.0).text("Precision"));
+
+    ui.add_space(8.0);
+
+    // System Prompt
+    ui.label(egui::RichText::new("Prompt de Transcripcion:").color(Color32::from_rgb(170, 180, 195)));
+    ui.add(
+        egui::TextEdit::multiline(&mut app.settings.prompt)
+            .desired_rows(3)
+            .desired_width(f32::INFINITY),
+    );
+
+    ui.add_space(12.0);
+
+    if ui
+        .button(egui::RichText::new("Guardar cambios").strong().color(Color32::from_rgb(240, 245, 255)))
+        .clicked()
+    {
+        app.sync_shortcut();
+        let _ = crate::autostart::set_autostart(app.settings.autostart);
+        if let Err(e) = app.settings.save() {
+            app.status_message = format!("Error al guardar: {e}");
+        } else {
+            app.status_message = "Cambios guardados con exito".into();
+        }
     }
 }

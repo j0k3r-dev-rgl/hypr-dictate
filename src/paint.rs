@@ -1,167 +1,144 @@
-use anyhow::Result;
-use cairo::{Context, Format, ImageSurface, LinearGradient};
+use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 
-fn ease(t: f64) -> f64 {
-    let t = t.clamp(0., 1.);
+pub fn ease(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
     if t < 0.5 {
-        4. * t * t * t
+        4.0 * t * t * t
     } else {
-        1. - (-2. * t + 2.).powi(3) / 2.
+        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
     }
 }
 
-pub fn shell(
-    width: i32,
-    height: i32,
-    color: [u8; 3],
-    open: f64,
-    level: f64,
-    tick: f64,
-) -> Result<Vec<u8>> {
-    let mut surface = ImageSurface::create(Format::ARgb32, width, height)?;
-    {
-        let c = Context::new(&surface)?;
-        let eased = ease(open);
-        let rgb = color.map(|v| v as f64 / 255.);
-        let h = height as f64;
-
-        // Rock-solid fixed dimensions: the outer shell never wobbles or breathes
-        let current_w = 88. + eased * 76.;
-        let current_h = 14. + eased * 24.;
-        let left = (width as f64 - current_w) / 2.;
-        let top = h - current_h;
-
-        // Fixed outer boundary (strictly inside carapace, zero rectangular shadow)
-        carapace(&c, left, left + current_w, h, top);
-        c.set_source_rgba(rgb[0], rgb[1], rgb[2], 0.18 + eased * 0.22);
-        c.set_line_width(4.);
-        c.stroke()?;
-
-        // Inner solid dark fill
-        let g = LinearGradient::new(0., top, 0., h);
-        g.add_color_stop_rgba(0., 0.11, 0.14, 0.21, 0.99);
-        g.add_color_stop_rgba(1., 0.02, 0.03, 0.05, 1.0);
-        carapace(&c, left + 1.5, left + current_w - 1.5, h, top + 1.5);
-        c.set_source(&g)?;
-        c.fill_preserve()?;
-
-        // Solid crisp border outline (constant width, never pulsing)
-        c.set_source_rgba(rgb[0], rgb[1], rgb[2], 0.92);
-        c.set_line_width(1.5);
-        c.stroke()?;
-
-        // Tech ribs (constant)
-        c.set_source_rgba(rgb[0], rgb[1], rgb[2], 0.28);
-        c.set_line_width(1.);
-        for ratio in [0.28, 0.5, 0.72] {
-            let x = left + current_w * ratio;
-            c.move_to(x, top + 3.);
-            c.line_to(left + current_w * (0.18 + ratio * 0.64), h - 1.);
-            c.stroke()?;
-        }
-
-        // ONLY the interior bars move in response to your voice
-        if eased > 0.08 {
-            for i in -8i32..=8 {
-                let x = width as f64 / 2. + i as f64 * 5.2;
-                let distance = 1. - i.abs() as f64 / 9.2;
-                let phase = i as f64 * 0.85;
-
-                let bar = if level >= 0. {
-                    if level > 0.02 {
-                        // Voice detected: energetic dancing bars scaled dynamically to voice volume
-                        let voice_jitter = (tick * 0.45 + phase).sin().abs() * 0.45
-                            + (tick * 0.85 + phase * 1.8).sin().abs() * 0.35;
-                        (3.0 + level * 25.0 * (0.35 + voice_jitter)) * eased * distance.powf(0.55)
-                    } else {
-                        // Silence while listening: gentle, subtle living wave so you know it's active
-                        let idle_wave = (tick * 0.12 + phase * 0.45).sin().abs() * 2.0;
-                        (2.5 + idle_wave) * eased * distance.powf(0.6)
-                    }
-                } else {
-                    // Processing / transcribing state: smooth sweeping wave
-                    (2.5 + 11.0 * ((tick * 0.22 - phase * 0.55).sin() * 0.5 + 0.5))
-                        * eased
-                        * distance
-                };
-
-                let alpha = (0.45 + 0.55 * distance) * eased;
-                c.set_source_rgba(rgb[0], rgb[1], rgb[2], alpha);
-                rounded(&c, x - 1.6, h - 3. - bar, 3.2, bar.max(1.5), 1.6);
-                c.fill()?;
-            }
-        }
-
-        // Central grip handle (constant, solid)
-        c.set_source_rgba(0.95, 0.97, 1., 0.85);
-        rounded(
-            &c,
-            width as f64 / 2. - 7.,
-            h - current_h * 0.55,
-            14.,
-            2.4,
-            1.2,
-        );
-        c.fill()?;
-    }
-    surface.flush();
-    Ok(surface.data()?.to_vec())
-}
-fn carapace(c: &Context, left: f64, right: f64, bottom: f64, top: f64) {
-    let mid = (left + right) / 2.;
+pub fn carapace_points(left: f32, right: f32, flat_y: f32, arch_y: f32) -> Vec<Pos2> {
     let span = right - left;
-    c.new_sub_path();
-    c.move_to(left, bottom);
-    c.line_to(left + span * 0.08, top + (bottom - top) * 0.42);
-    c.curve_to(left + span * 0.22, top, left + span * 0.36, top, mid, top);
-    c.curve_to(
-        right - span * 0.36,
-        top,
-        right - span * 0.22,
-        top,
-        right - span * 0.08,
-        top + (bottom - top) * 0.42,
-    );
-    c.line_to(right, bottom);
-    c.close_path();
-}
-fn rounded(c: &Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
-    c.new_sub_path();
-    c.arc(x + w - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.);
-    c.arc(x + w - r, y + h - r, r, 0., std::f64::consts::FRAC_PI_2);
-    c.arc(
-        x + r,
-        y + h - r,
-        r,
-        std::f64::consts::FRAC_PI_2,
-        std::f64::consts::PI,
-    );
-    c.arc(
-        x + r,
-        y + r,
-        r,
-        std::f64::consts::PI,
-        std::f64::consts::PI * 1.5,
-    );
-    c.close_path();
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn dock_keeps_transparent_corners_and_animated_shape() {
-        let small = shell(176, 44, [55, 170, 130], 0., 0., 0.).unwrap();
-        let expanded = shell(176, 44, [235, 65, 75], 1., 0.7, 3.).unwrap();
-        assert_ne!(small, expanded);
-        assert_eq!(&small[..176 * 24 * 4], &vec![0; 176 * 24 * 4]);
-        assert_eq!(&expanded[..4], &[0, 0, 0, 0]);
+    let mid = (left + right) / 2.0;
+    let mut points = Vec::with_capacity(26);
+
+    points.push(Pos2::new(left, flat_y));
+    points.push(Pos2::new(left + span * 0.08, arch_y + (flat_y - arch_y) * 0.42));
+
+    let p0 = Pos2::new(left + span * 0.08, arch_y + (flat_y - arch_y) * 0.42);
+    let p1 = Pos2::new(left + span * 0.22, arch_y);
+    let p2 = Pos2::new(left + span * 0.36, arch_y);
+    let p3 = Pos2::new(mid, arch_y);
+    for step in 1..=8 {
+        let t = step as f32 / 8.0;
+        let it = 1.0 - t;
+        let x = it * it * it * p0.x + 3.0 * it * it * t * p1.x + 3.0 * it * t * t * p2.x + t * t * t * p3.x;
+        let y = it * it * it * p0.y + 3.0 * it * it * t * p1.y + 3.0 * it * t * t * p2.y + t * t * t * p3.y;
+        points.push(Pos2::new(x, y));
     }
-    #[test]
-    fn ease_curve_is_monotonic() {
-        assert_eq!(ease(0.), 0.);
-        assert!((ease(1.) - 1.).abs() < 1e-9);
-        for i in 1..=20 {
-            assert!(ease(i as f64 / 20.) >= ease((i - 1) as f64 / 20.));
+
+    let p0 = Pos2::new(mid, arch_y);
+    let p1 = Pos2::new(right - span * 0.36, arch_y);
+    let p2 = Pos2::new(right - span * 0.22, arch_y);
+    let p3 = Pos2::new(right - span * 0.08, arch_y + (flat_y - arch_y) * 0.42);
+    for step in 1..=8 {
+        let t = step as f32 / 8.0;
+        let it = 1.0 - t;
+        let x = it * it * it * p0.x + 3.0 * it * it * t * p1.x + 3.0 * it * t * t * p2.x + t * t * t * p3.x;
+        let y = it * it * it * p0.y + 3.0 * it * it * t * p1.y + 3.0 * it * t * t * p2.y + t * t * t * p3.y;
+        points.push(Pos2::new(x, y));
+    }
+
+    points.push(Pos2::new(right, flat_y));
+    points
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn draw_carapace(
+    painter: &egui::Painter,
+    width: f32,
+    height: f32,
+    color: Color32,
+    open: f32,
+    level: f32,
+    tick: f32,
+    position: &str,
+) {
+    let eased = ease(open as f64) as f32;
+    let current_w = 88.0 + eased * 76.0;
+    let current_h = 14.0 + eased * 24.0;
+    let left = (width - current_w) / 2.0;
+
+    let is_top = position == "Arriba";
+    let (flat_y, arch_y) = if is_top {
+        (0.0, current_h)
+    } else {
+        (height, height - current_h)
+    };
+
+    let points = carapace_points(left, left + current_w, flat_y, arch_y);
+
+    // 1. Soft outer boundary glow
+    let glow_alpha = ((0.18 + eased * 0.22) * 255.0).clamp(0.0, 255.0) as u8;
+    let glow_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), glow_alpha);
+    painter.add(egui::Shape::closed_line(points.clone(), Stroke::new(3.5, glow_color)));
+
+    // 2. Inner dark fill
+    let inner_flat = if is_top { flat_y + 1.0 } else { flat_y - 1.0 };
+    let inner_arch = if is_top { arch_y - 1.5 } else { arch_y + 1.5 };
+    let inner_points = carapace_points(left + 1.5, left + current_w - 1.5, inner_flat, inner_arch);
+    painter.add(egui::Shape::convex_polygon(inner_points, Color32::from_rgb(10, 14, 22), Stroke::NONE));
+
+    // 3. Crisp outline
+    let border_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 235);
+    painter.add(egui::Shape::closed_line(points, Stroke::new(1.5, border_color)));
+
+    // 4. Tech ribs
+    let rib_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 70);
+    for ratio in [0.28, 0.5, 0.72] {
+        let x = left + current_w * ratio;
+        let x2 = left + current_w * (0.18 + ratio * 0.64);
+        if is_top {
+            painter.line_segment([Pos2::new(x, flat_y + 1.0), Pos2::new(x2, arch_y - 3.0)], Stroke::new(1.0, rib_color));
+        } else {
+            painter.line_segment([Pos2::new(x, arch_y + 3.0), Pos2::new(x2, flat_y - 1.0)], Stroke::new(1.0, rib_color));
         }
     }
+
+    // 5. Interior voice bars
+    if eased > 0.08 {
+        for i in -8..=8 {
+            let x = width / 2.0 + (i as f32) * 5.2;
+            let dist = 1.0 - (i as f32).abs() / 9.2;
+            let phase = (i as f32) * 0.85;
+
+            let bar = if level >= 0.0 {
+                if level > 0.02 {
+                    let voice_jitter = (tick * 0.45 + phase).sin().abs() * 0.45
+                        + (tick * 0.85 + phase * 1.8).sin().abs() * 0.35;
+                    (3.0 + level * 25.0 * (0.35 + voice_jitter)) * eased * dist.powf(0.55)
+                } else {
+                    let idle_wave = (tick * 0.12 + phase * 0.45).sin().abs() * 2.0;
+                    (2.5 + idle_wave) * eased * dist.powf(0.6)
+                }
+            } else {
+                // Processing sweeping wave
+                (2.5 + 11.0 * ((tick * 0.22 - phase * 0.55).sin() * 0.5 + 0.5)) * eased * dist
+            };
+
+            let alpha = ((0.45 + 0.55 * dist) * eased * 255.0).clamp(0.0, 255.0) as u8;
+            let bar_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+            let bar_h = bar.max(1.5);
+            let bar_rect = if is_top {
+                Rect::from_min_size(Pos2::new(x - 1.6, flat_y + 3.0), Vec2::new(3.2, bar_h))
+            } else {
+                Rect::from_min_size(Pos2::new(x - 1.6, flat_y - 3.0 - bar_h), Vec2::new(3.2, bar_h))
+            };
+            painter.rect_filled(bar_rect, 1.6, bar_color);
+        }
+    }
+
+    // 6. Central grip handle
+    let handle_y = if is_top {
+        current_h * 0.55 - 1.2
+    } else {
+        flat_y - current_h * 0.55
+    };
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(width / 2.0 - 7.0, handle_y), Vec2::new(14.0, 2.4)),
+        1.2,
+        Color32::from_rgba_unmultiplied(240, 245, 255, 215),
+    );
 }
