@@ -37,7 +37,14 @@ fn main() -> Result<()> {
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     let (init_x, init_y) = match settings.position.as_str() {
-        "Arriba" => (((screen_w - 176) / 2).max(10), 38),
+        "Arriba" => (
+            if settings.x > 0 && settings.x < screen_w - 50 {
+                settings.x
+            } else {
+                ((screen_w / 2) - 260).max(10)
+            },
+            0,
+        ),
         "Izquierda" => (0, ((screen_h - 44) / 2).max(10)),
         "Derecha" => ((screen_w - 176).max(10), ((screen_h - 44) / 2).max(10)),
         _ => (((screen_w - 176) / 2).max(10), (screen_h - 44).max(0)),

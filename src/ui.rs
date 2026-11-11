@@ -60,7 +60,40 @@ pub struct DictateApp {
 
     pub anim_time: f64,
     pub open: f32,
-    pub first_frame: bool,
+    pub startup_frames: u8,
+}
+
+unsafe fn find_own_window() -> windows_sys::Win32::Foundation::HWND {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId,
+    };
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: isize) -> i32 {
+        unsafe {
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == GetCurrentProcessId() {
+                let mut buf = [0u16; 64];
+                let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+                if len > 0 {
+                    let title = String::from_utf16_lossy(&buf[..len as usize]);
+                    if title == "hypr-dictate" {
+                        *(lparam as *mut HWND) = hwnd;
+                        return 0; // stop
+                    }
+                }
+            }
+            1
+        }
+    }
+
+    unsafe {
+        let mut found_hwnd: HWND = std::ptr::null_mut();
+        EnumWindows(Some(enum_proc), &mut found_hwnd as *mut HWND as isize);
+        found_hwnd
+    }
 }
 
 impl DictateApp {
@@ -101,7 +134,7 @@ impl DictateApp {
             model_filter: String::new(),
             anim_time: 0.0,
             open: 0.0,
-            first_frame: true,
+            startup_frames: 0,
         };
 
         app.refresh_catalog();
@@ -341,7 +374,7 @@ impl DictateApp {
                     }
                     "settings" => {
                         self.show_settings = !self.show_settings;
-                        self.first_frame = true;
+                        self.startup_frames = 0;
                     }
                     _ => {}
                 },
@@ -418,45 +451,67 @@ impl DictateApp {
             (176.0, 44.0)
         };
 
-        let (x, y) = match self.settings.position.as_str() {
-            "Arriba" => (
+        let (x, y) = if self.show_settings {
+            (
                 ((screen_w - w) / 2.0).max(10.0),
-                38.0,
-            ),
-            "Izquierda" => (
-                0.0,
                 ((screen_h - h) / 2.0).max(10.0),
-            ),
-            "Derecha" => (
-                (screen_w - w).max(10.0),
-                ((screen_h - h) / 2.0).max(10.0),
-            ),
-            _ => (
-                // "Abajo"
-                ((screen_w - w) / 2.0).max(10.0),
-                (screen_h - h).max(0.0),
-            ),
+            )
+        } else {
+            match self.settings.position.as_str() {
+                "Arriba" => {
+                    let target_x = if self.settings.x > 0 && (self.settings.x as f32) < screen_w - 50.0 {
+                        self.settings.x as f32
+                    } else {
+                        // Positioned to the left of the center date/time (center is screen_w / 2)
+                        ((screen_w / 2.0) - 260.0).max(10.0)
+                    };
+                    (target_x, 0.0)
+                }
+                "Izquierda" => (
+                    0.0,
+                    ((screen_h - h) / 2.0).max(10.0),
+                ),
+                "Derecha" => (
+                    (screen_w - w).max(10.0),
+                    ((screen_h - h) / 2.0).max(10.0),
+                ),
+                _ => (
+                    // "Abajo"
+                    ((screen_w - w) / 2.0).max(10.0),
+                    (screen_h - h).max(0.0),
+                ),
+            }
         };
 
-        let title: Vec<u16> = "hypr-dictate\0".encode_utf16().collect();
-        let hwnd = unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::FindWindowW(
-                std::ptr::null(),
-                title.as_ptr(),
-            )
-        };
+        let hwnd = unsafe { find_own_window() };
         if !hwnd.is_null() {
             unsafe {
+                use windows_sys::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+                use windows_sys::Win32::UI::Controls::MARGINS;
                 use windows_sys::Win32::UI::WindowsAndMessaging::{
-                    GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
-                    SWP_FRAMECHANGED, SWP_SHOWWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                    GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+                    SWP_FRAMECHANGED, SWP_SHOWWINDOW, WS_POPUP, WS_VISIBLE,
+                    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_WINDOWEDGE,
                 };
+
+                // Remove all standard window chrome, titlebars, close buttons and borders
+                SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE) as isize);
+
+                // Set extended styles: toolwindow + topmost, and explicitly strip appwindow & windowedge
                 let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                SetWindowLongPtrW(
-                    hwnd,
-                    GWL_EXSTYLE,
-                    ex | (WS_EX_TOOLWINDOW | WS_EX_TOPMOST) as isize,
-                );
+                let new_ex = (ex | (WS_EX_TOOLWINDOW | WS_EX_TOPMOST) as isize)
+                    & !((WS_EX_APPWINDOW | WS_EX_WINDOWEDGE) as isize);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex);
+
+                // Extend DWM frame to make the background 100% transparent glass (no black/square box)
+                let margins = MARGINS {
+                    cxLeftWidth: -1,
+                    cxRightWidth: -1,
+                    cyTopHeight: -1,
+                    cyBottomHeight: -1,
+                };
+                let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+
                 SetWindowPos(
                     hwnd,
                     -1isize as windows_sys::Win32::Foundation::HWND, // HWND_TOPMOST
@@ -497,9 +552,10 @@ impl eframe::App for DictateApp {
             self.open = (self.open - dt * 6.0).max(target_open);
         }
 
-        if self.first_frame {
+        if self.startup_frames < 5 {
             self.reposition_window(&ctx);
-            self.first_frame = false;
+            self.startup_frames += 1;
+            ctx.request_repaint();
         }
 
         // Cancel with Escape key at any time while recording or processing
@@ -579,7 +635,7 @@ fn render_settings_window(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui::C
             ui.heading(egui::RichText::new("Ajustes - HyprDictate").size(16.0).strong().color(Color32::from_rgb(230, 235, 245)));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(egui::RichText::new(" X ").strong().color(Color32::from_rgb(220, 100, 100))).clicked() {
+                if ui.button(egui::RichText::new(" Volver al dock ").size(12.0).color(Color32::from_rgb(180, 195, 215))).clicked() {
                     app.show_settings = false;
                     app.reposition_window(ctx);
                 }
@@ -685,6 +741,27 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                 ui.selectable_value(&mut app.settings.position, pos.into(), pos);
             }
         });
+
+    if app.settings.position == "Arriba" {
+        ui.add_space(4.0);
+        let screen_w = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(0) };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Posición horizontal (X):").size(12.0).color(Color32::from_rgb(150, 160, 175)));
+            if ui.add(egui::Slider::new(&mut app.settings.x, 10..=(screen_w - 186)).text("px")).changed() {
+                app.reposition_window(ui.ctx());
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button(egui::RichText::new("Izquierda de Fecha/Hora (Recomendado)").size(11.0)).clicked() {
+                app.settings.x = ((screen_w / 2) - 260).max(10);
+                app.reposition_window(ui.ctx());
+            }
+            if ui.button(egui::RichText::new("Centro").size(11.0)).clicked() {
+                app.settings.x = ((screen_w - 176) / 2).max(10);
+                app.reposition_window(ui.ctx());
+            }
+        });
+    }
 
     if old_pos != app.settings.position {
         app.reposition_window(ui.ctx());
@@ -876,17 +953,38 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
     ui.small("Tip: Puedes mantener presionado el atajo para hablar y soltarlo para transcribir, o presionarlo una vez para iniciar y otra para finalizar. Pulsa Escape para cancelar.");
 
     ui.add_space(14.0);
+    ui.separator();
+    ui.add_space(8.0);
 
-    if ui
-        .button(egui::RichText::new("Guardar cambios").strong().color(Color32::from_rgb(240, 245, 255)))
-        .clicked()
-    {
-        app.sync_shortcut();
-        let _ = crate::autostart::set_autostart(app.settings.autostart);
-        if let Err(e) = app.settings.save() {
-            app.status_message = format!("Error al guardar: {e}");
-        } else {
-            app.status_message = "Cambios guardados con éxito".into();
+    ui.horizontal(|ui| {
+        if ui
+            .button(egui::RichText::new("Guardar cambios").strong().color(Color32::from_rgb(240, 245, 255)))
+            .clicked()
+        {
+            app.sync_shortcut();
+            let _ = crate::autostart::set_autostart(app.settings.autostart);
+            if let Err(e) = app.settings.save() {
+                app.status_message = format!("Error al guardar: {e}");
+            } else {
+                app.status_message = "Cambios guardados con éxito".into();
+            }
         }
-    }
+
+        if ui
+            .button(egui::RichText::new("Volver al dock").color(Color32::from_rgb(180, 195, 215)))
+            .clicked()
+        {
+            app.show_settings = false;
+            app.reposition_window(ui.ctx());
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button(egui::RichText::new("Cerrar y Salir de HyprDictate").strong().color(Color32::from_rgb(235, 80, 80)))
+                .clicked()
+            {
+                std::process::exit(0);
+            }
+        });
+    });
 }
