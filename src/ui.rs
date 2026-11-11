@@ -447,7 +447,10 @@ impl DictateApp {
             return;
         }
         unsafe {
-            use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+            use windows_sys::Win32::Foundation::POINT;
+            use windows_sys::Win32::Graphics::Gdi::{
+                ALTERNATE, CreatePolygonRgn, CreateRoundRectRgn, SetWindowRgn,
+            };
             let ppp = ctx.pixels_per_point();
             if self.show_settings {
                 let w = (470.0 * ppp).round() as i32;
@@ -458,13 +461,30 @@ impl DictateApp {
                     SetWindowRgn(hwnd, rgn, 1);
                 }
             } else {
-                let pill = paint::pill_dimensions(144.0, 32.0, self.open);
-                let x1 = (pill.min.x * ppp).floor() as i32;
-                let y1 = (pill.min.y * ppp).floor() as i32;
-                let x2 = (pill.max.x * ppp).ceil() as i32;
-                let y2 = (pill.max.y * ppp).ceil() as i32;
-                let r = (pill.height() * ppp).round() as i32;
-                let rgn = CreateRoundRectRgn(x1, y1, x2, y2, r, r);
+                let eased = paint::ease(self.open as f64) as f32;
+                let width = 176.0;
+                let height = 44.0;
+                let current_w = 88.0 + eased * 76.0 + 4.0;
+                let current_h = 14.0 + eased * 24.0 + 2.0;
+                let left = (width - current_w) / 2.0;
+
+                let is_top = self.settings.position == "Arriba";
+                let (flat_y, arch_y) = if is_top {
+                    (1.0, current_h)
+                } else {
+                    (height, height - current_h)
+                };
+
+                let pts = paint::carapace_points(left, left + current_w, flat_y, arch_y);
+                let gdi_pts: Vec<POINT> = pts
+                    .into_iter()
+                    .map(|p| POINT {
+                        x: (p.x * ppp).round() as i32,
+                        y: (p.y * ppp).round() as i32,
+                    })
+                    .collect();
+
+                let rgn = CreatePolygonRgn(gdi_pts.as_ptr(), gdi_pts.len() as i32, ALTERNATE);
                 if !rgn.is_null() {
                     SetWindowRgn(hwnd, rgn, 1);
                 }
@@ -479,7 +499,7 @@ impl DictateApp {
         let (w, h) = if self.show_settings {
             (470.0, 560.0)
         } else {
-            (144.0, 32.0)
+            (176.0, 44.0)
         };
 
         let (x, y) = if self.show_settings {
@@ -493,9 +513,9 @@ impl DictateApp {
                     let target_x = if self.settings.x > 0 && (self.settings.x as f32) < screen_w - 50.0 {
                         self.settings.x as f32
                     } else {
-                        ((screen_w / 2.0) - 300.0).max(10.0)
+                        640.0
                     };
-                    (target_x, 6.0)
+                    (target_x, 37.0)
                 }
                 "Izquierda" => (
                     0.0,
@@ -606,7 +626,7 @@ impl eframe::App for DictateApp {
 }
 
 fn render_original_carapace(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui::Context) {
-    let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(144.0, 32.0));
+    let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(176.0, 44.0));
     let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
     if response.dragged() {
@@ -631,10 +651,10 @@ fn render_original_carapace(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui:
     };
 
     let painter = ui.painter_at(rect);
-    paint::draw_voice_pill(
+    paint::draw_carapace(
         &painter,
-        144.0,
-        32.0,
+        176.0,
+        44.0,
         app.state_color(),
         app.open,
         level_f,
@@ -776,11 +796,11 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         });
         ui.horizontal(|ui| {
             if ui.button(egui::RichText::new("Izquierda de Fecha/Hora (Recomendado)").size(11.0)).clicked() {
-                app.settings.x = ((screen_w / 2) - 300).max(10);
+                app.settings.x = 640;
                 app.reposition_window(ui.ctx());
             }
             if ui.button(egui::RichText::new("Centro").size(11.0)).clicked() {
-                app.settings.x = ((screen_w - 144) / 2).max(10);
+                app.settings.x = ((screen_w - 176) / 2).max(10);
                 app.reposition_window(ui.ctx());
             }
         });

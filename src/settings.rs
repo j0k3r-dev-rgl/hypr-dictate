@@ -55,7 +55,7 @@ impl Default for Settings {
             base_url: DEFAULT_BASE_URL.into(),
             api_key: std::env::var("CLIPROXYAPI_API_KEY").unwrap_or_default(),
             x: 660,
-            y: 6,
+            y: 38,
             shortcut: "F9".into(),
             shortcut_formal: "F10".into(),
             microphone: String::new(),
@@ -92,8 +92,9 @@ impl Settings {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let data = std::fs::read(&path)?;
-        let v: Value = serde_json::from_slice(&data)?;
+        let raw_data = std::fs::read(&path)?;
+        let data = raw_data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&raw_data);
+        let v: Value = serde_json::from_slice(data)?;
         let mut s = Self::default();
 
         if let Some(m) = v["model"].as_str() {

@@ -41,13 +41,13 @@ fn main() -> Result<()> {
             if settings.x > 0 && settings.x < screen_w - 50 {
                 settings.x
             } else {
-                660
+                640
             },
-            6,
+            37,
         ),
-        "Izquierda" => (0, ((screen_h - 32) / 2).max(10)),
-        "Derecha" => ((screen_w - 144).max(10), ((screen_h - 32) / 2).max(10)),
-        _ => (((screen_w - 144) / 2).max(10), (screen_h - 32).max(0)),
+        "Izquierda" => (0, ((screen_h - 44) / 2).max(10)),
+        "Derecha" => ((screen_w - 176).max(10), ((screen_h - 44) / 2).max(10)),
+        _ => (((screen_w - 176) / 2).max(10), (screen_h - 44).max(0)),
     };
 
     let shared_shortcuts = Arc::new(RwLock::new(shortcut::ShortcutSettings {
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()
-        .with_inner_size([144.0, 32.0])
+        .with_inner_size([176.0, 44.0])
         .with_position([init_x as f32, init_y as f32]);
 
     let options = eframe::NativeOptions {

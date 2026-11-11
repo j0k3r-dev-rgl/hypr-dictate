@@ -1,4 +1,4 @@
-use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 
 pub fn ease(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
@@ -9,17 +9,44 @@ pub fn ease(t: f64) -> f64 {
     }
 }
 
-pub fn pill_dimensions(width: f32, height: f32, open: f32) -> Rect {
-    let eased = ease(open as f64) as f32;
-    let pill_w = 88.0 + eased * 42.0; // 88px idle -> 130px recording
-    let pill_h = 24.0 + eased * 4.0;  // 24px idle -> 28px recording
-    let left = (width - pill_w) / 2.0;
-    let top = (height - pill_h) / 2.0;
-    Rect::from_min_size(Pos2::new(left, top), Vec2::new(pill_w, pill_h))
+pub fn carapace_points(left: f32, right: f32, flat_y: f32, arch_y: f32) -> Vec<Pos2> {
+    let span = right - left;
+    let mid = (left + right) / 2.0;
+    let mut points = Vec::with_capacity(26);
+
+    points.push(Pos2::new(left, flat_y));
+    points.push(Pos2::new(left + span * 0.08, arch_y + (flat_y - arch_y) * 0.42));
+
+    let p0 = Pos2::new(left + span * 0.08, arch_y + (flat_y - arch_y) * 0.42);
+    let p1 = Pos2::new(left + span * 0.22, arch_y);
+    let p2 = Pos2::new(left + span * 0.36, arch_y);
+    let p3 = Pos2::new(mid, arch_y);
+    for step in 1..=8 {
+        let t = step as f32 / 8.0;
+        let it = 1.0 - t;
+        let x = it * it * it * p0.x + 3.0 * it * it * t * p1.x + 3.0 * it * t * t * p2.x + t * t * t * p3.x;
+        let y = it * it * it * p0.y + 3.0 * it * it * t * p1.y + 3.0 * it * t * t * p2.y + t * t * t * p3.y;
+        points.push(Pos2::new(x, y));
+    }
+
+    let p0 = Pos2::new(mid, arch_y);
+    let p1 = Pos2::new(right - span * 0.36, arch_y);
+    let p2 = Pos2::new(right - span * 0.22, arch_y);
+    let p3 = Pos2::new(right - span * 0.08, arch_y + (flat_y - arch_y) * 0.42);
+    for step in 1..=8 {
+        let t = step as f32 / 8.0;
+        let it = 1.0 - t;
+        let x = it * it * it * p0.x + 3.0 * it * it * t * p1.x + 3.0 * it * t * t * p2.x + t * t * t * p3.x;
+        let y = it * it * it * p0.y + 3.0 * it * it * t * p1.y + 3.0 * it * t * t * p2.y + t * t * t * p3.y;
+        points.push(Pos2::new(x, y));
+    }
+
+    points.push(Pos2::new(right, flat_y));
+    points
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn draw_voice_pill(
+pub fn draw_carapace(
     painter: &egui::Painter,
     width: f32,
     height: f32,
@@ -27,63 +54,80 @@ pub fn draw_voice_pill(
     open: f32,
     level: f32,
     tick: f32,
-    _position: &str,
+    position: &str,
 ) {
     let eased = ease(open as f64) as f32;
-    let rect = pill_dimensions(width, height, open);
-    let radius = CornerRadius::same((rect.height() / 2.0).round() as u8);
+    let current_w = 88.0 + eased * 76.0;
+    let current_h = 14.0 + eased * 24.0;
+    let left = (width - current_w) / 2.0;
 
-    // 1. Sleek dark translucent pill background matching Zebar mantle (#181825)
-    painter.rect_filled(rect, radius, Color32::from_rgb(24, 24, 37));
+    let is_top = position == "Arriba";
+    let (flat_y, arch_y) = if is_top {
+        (0.0, current_h)
+    } else {
+        (height, height - current_h)
+    };
 
-    // 2. Subtle crisp colored oval border
-    let border_alpha = ((0.55 + eased * 0.40) * 255.0).clamp(0.0, 255.0) as u8;
-    let border_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), border_alpha);
-    painter.rect_stroke(
-        rect.shrink(0.75),
-        radius,
-        Stroke::new(1.3, border_color),
-        egui::StrokeKind::Inside,
-    );
+    let points = carapace_points(left, left + current_w, flat_y, arch_y);
 
-    // 3. Centered symmetric voice visualizer bars ONLY
-    let count: i32 = if eased > 0.25 { 6 } else { 4 };
-    let spacing = if eased > 0.25 { 7.5 } else { 7.0 };
-    let center_x = rect.center().x;
-    let center_y = rect.center().y;
-    let max_bar_h = rect.height() - 8.0;
+    // 1. Soft outer boundary glow (open curve, no top flat line)
+    let glow_alpha = ((0.18 + eased * 0.22) * 255.0).clamp(0.0, 255.0) as u8;
+    let glow_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), glow_alpha);
+    painter.add(egui::Shape::line(points.clone(), Stroke::new(3.5, glow_color)));
 
-    for i in -count..=count {
-        let x = center_x + (i as f32) * spacing;
-        let dist = 1.0 - (i as f32).abs() / (count as f32 + 1.2);
-        let phase = (i as f32) * 0.85;
+    // 2. Inner dark fill
+    let inner_flat = if is_top { flat_y + 1.0 } else { flat_y - 1.0 };
+    let inner_arch = if is_top { arch_y - 1.5 } else { arch_y + 1.5 };
+    let inner_points = carapace_points(left + 1.5, left + current_w - 1.5, inner_flat, inner_arch);
+    painter.add(egui::Shape::convex_polygon(inner_points, Color32::from_rgb(10, 14, 22), Stroke::NONE));
 
-        let bar_h = if level < 0.0 {
-            // Processing sweeping wave
-            let wave = (tick * 0.24 - phase * 0.65).sin() * 0.5 + 0.5;
-            (4.0 + wave * (max_bar_h - 4.0)) * dist.powf(0.45)
-        } else if eased > 0.05 {
-            // Active recording voice equalizer
-            if level > 0.015 {
-                let jitter = (tick * 0.45 + phase).sin().abs() * 0.45
-                    + (tick * 0.85 + phase * 1.8).sin().abs() * 0.35;
-                (4.0 + level * (max_bar_h * 1.35) * (0.4 + jitter)) * dist.powf(0.5)
+    // 3. Crisp outline (open curve along the arch only, no flat edge line)
+    let border_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 235);
+    painter.add(egui::Shape::line(points, Stroke::new(1.5, border_color)));
+
+    // 4. Interior voice bars
+    if eased > 0.08 {
+        for i in -8..=8 {
+            let x = width / 2.0 + (i as f32) * 5.2;
+            let dist = 1.0 - (i as f32).abs() / 9.2;
+            let phase = (i as f32) * 0.85;
+
+            let bar = if level >= 0.0 {
+                if level > 0.02 {
+                    let voice_jitter = (tick * 0.45 + phase).sin().abs() * 0.45
+                        + (tick * 0.85 + phase * 1.8).sin().abs() * 0.35;
+                    (3.0 + level * 25.0 * (0.35 + voice_jitter)) * eased * dist.powf(0.55)
+                } else {
+                    let idle_wave = (tick * 0.12 + phase * 0.45).sin().abs() * 2.0;
+                    (2.5 + idle_wave) * eased * dist.powf(0.6)
+                }
             } else {
-                let gentle = (tick * 0.14 + phase * 0.5).sin().abs() * 3.0;
-                (4.5 + gentle) * dist.powf(0.55)
-            }
-        } else {
-            // Calm, clean idle voice indicator shape
-            let base = 4.0 + 7.5 * dist.powf(1.4);
-            let breathe = (tick * 0.06 + phase * 0.35).sin().abs() * 1.2;
-            base + breathe
-        };
+                // Processing sweeping wave
+                (2.5 + 11.0 * ((tick * 0.22 - phase * 0.55).sin() * 0.5 + 0.5)) * eased * dist
+            };
 
-        let clamped_h = bar_h.clamp(3.0, max_bar_h);
-        let alpha = ((0.60 + 0.40 * dist) * (0.75 + 0.25 * eased) * 255.0).clamp(0.0, 255.0) as u8;
-        let bar_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
-
-        let bar_rect = Rect::from_center_size(Pos2::new(x, center_y), Vec2::new(3.0, clamped_h));
-        painter.rect_filled(bar_rect, 1.5, bar_color);
+            let alpha = ((0.45 + 0.55 * dist) * eased * 255.0).clamp(0.0, 255.0) as u8;
+            let bar_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+            let bar_h = bar.max(1.5);
+            let bar_rect = if is_top {
+                Rect::from_min_size(Pos2::new(x - 1.6, flat_y + 3.0), Vec2::new(3.2, bar_h))
+            } else {
+                Rect::from_min_size(Pos2::new(x - 1.6, flat_y - 3.0 - bar_h), Vec2::new(3.2, bar_h))
+            };
+            painter.rect_filled(bar_rect, 1.6, bar_color);
+        }
     }
+
+    // 5. Subtle central grip handle colored with state accent (no bright white line)
+    let handle_y = if is_top {
+        current_h * 0.52 - 1.2
+    } else {
+        flat_y - current_h * 0.52
+    };
+    let handle_color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 190);
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(width / 2.0 - 7.0, handle_y), Vec2::new(14.0, 2.4)),
+        1.2,
+        handle_color,
+    );
 }
