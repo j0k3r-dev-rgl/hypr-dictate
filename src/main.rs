@@ -43,10 +43,11 @@ fn main() -> Result<()> {
         _ => (((screen_w - 176) / 2).max(10), (screen_h - 44).max(0)),
     };
 
-    let shared_shortcut = Arc::new(RwLock::new((
-        settings.shortcut.clone(),
-        settings.hold_to_talk,
-    )));
+    let shared_shortcuts = Arc::new(RwLock::new(shortcut::ShortcutSettings {
+        standard: settings.shortcut.clone(),
+        formal: settings.shortcut_formal.clone(),
+        hold_to_talk: settings.hold_to_talk,
+    }));
 
     let viewport = eframe::egui::ViewportBuilder::default()
         .with_title("hypr-dictate")
@@ -61,13 +62,13 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let shared_sc_clone = shared_shortcut.clone();
+    let shared_sc_clone = shared_shortcuts.clone();
 
     eframe::run_native(
         "hypr-dictate",
         options,
         Box::new(move |cc| {
-            let app = DictateApp::new(cc, settings, shared_shortcut);
+            let app = DictateApp::new(cc, settings, shared_shortcuts);
 
             // Start IPC listener
             let tx_ipc = app.tx.clone();

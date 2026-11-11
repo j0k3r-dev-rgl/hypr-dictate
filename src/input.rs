@@ -57,6 +57,38 @@ pub fn type_text(text: &str) -> Result<()> {
     let mut inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 4);
 
     for ch in text.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            // Emulate Enter key
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: 0x0D, // VK_RETURN
+                        wScan: 0,
+                        dwFlags: 0,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: 0x0D, // VK_RETURN
+                        wScan: 0,
+                        dwFlags: KEYEVENTF_KEYUP,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            });
+            continue;
+        }
+
         let mut utf16_buf = [0u16; 2];
         let units = ch.encode_utf16(&mut utf16_buf);
 

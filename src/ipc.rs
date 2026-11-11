@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::Sender;
 use std::thread;
 
-pub const IPC_PORT: u16 = 49271;
+pub const IPC_PORT: u16 = 39271;
 
 pub fn send_command(command: &str) -> Result<()> {
     let mut stream = TcpStream::connect(("127.0.0.1", IPC_PORT))

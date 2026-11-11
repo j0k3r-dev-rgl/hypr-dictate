@@ -6,7 +6,7 @@ use crate::{
     shortcut,
 };
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
-use hypr_dictate::{Phase, capture_valid, sanitize_plain_text};
+use hypr_dictate::{DictationMode, Phase, capture_valid, sanitize_text};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU32, Ordering},
@@ -22,13 +22,15 @@ pub enum SettingsTab {
 }
 
 pub enum UiEvent {
-    ShortcutDown,
-    ShortcutUp,
+    ShortcutDown(DictationMode),
+    ShortcutUp(DictationMode),
+    Cancel,
     IpcCommand(String),
     CatalogLoaded(Result<Vec<String>, String>),
     TranscriptionFinished {
         request_id: u64,
         address: String,
+        mode: DictationMode,
         result: Result<String, String>,
     },
 }
@@ -45,7 +47,8 @@ pub struct DictateApp {
 
     pub tx: Sender<UiEvent>,
     pub rx: Receiver<UiEvent>,
-    pub shared_shortcut: Arc<RwLock<(String, bool)>>,
+    pub shared_shortcuts: Arc<RwLock<shortcut::ShortcutSettings>>,
+    pub press_start: Option<std::time::Instant>,
 
     // UI state
     pub show_settings: bool,
@@ -64,7 +67,7 @@ impl DictateApp {
     pub fn new(
         _cc: &eframe::CreationContext<'_>,
         initial_settings: Settings,
-        shared_shortcut: Arc<RwLock<(String, bool)>>,
+        shared_shortcuts: Arc<RwLock<shortcut::ShortcutSettings>>,
     ) -> Self {
         let (tx, rx) = channel();
         let level = Arc::new(AtomicU32::new(0));
@@ -88,7 +91,8 @@ impl DictateApp {
             client,
             tx,
             rx,
-            shared_shortcut,
+            shared_shortcuts,
+            press_start: None,
             show_settings: false,
             active_tab: SettingsTab::Server,
             show_api_key: false,
@@ -105,8 +109,12 @@ impl DictateApp {
     }
 
     pub fn sync_shortcut(&self) {
-        if let Ok(mut guard) = self.shared_shortcut.write() {
-            *guard = (self.settings.shortcut.clone(), self.settings.hold_to_talk);
+        if let Ok(mut guard) = self.shared_shortcuts.write() {
+            *guard = shortcut::ShortcutSettings {
+                standard: self.settings.shortcut.clone(),
+                formal: self.settings.shortcut_formal.clone(),
+                hold_to_talk: self.settings.hold_to_talk,
+            };
         }
     }
 
@@ -131,7 +139,7 @@ impl DictateApp {
         });
     }
 
-    pub fn start_dictation(&mut self) {
+    pub fn start_dictation(&mut self, mode: DictationMode) {
         if !matches!(self.phase, Phase::Idle | Phase::Error) {
             return;
         }
@@ -158,21 +166,27 @@ impl DictateApp {
         match audio::start_recording(&self.settings.microphone, self.level.clone()) {
             Ok(capture) => {
                 self.capture = Some(capture);
-                self.phase = Phase::Recording(address);
-                self.status_message = "Grabando...".into();
+                self.phase = Phase::Recording {
+                    address,
+                    mode,
+                };
+                self.status_message = match mode {
+                    DictationMode::Transcription => "Grabando dictado...".into(),
+                    DictationMode::Formal => "Grabando redacción formal...".into(),
+                };
             }
             Err(e) => {
-                self.status_message = format!("Error microfono: {e}");
+                self.status_message = format!("Error micrófono: {e}");
                 self.phase = Phase::Error;
             }
         }
     }
 
-    pub fn stop_dictation(&mut self) {
+    pub fn stop_dictation_with_mode(&mut self, target_mode: DictationMode) {
         self.request_id_counter += 1;
         let req_id = self.request_id_counter;
 
-        let Some(address) = self.phase.stop(req_id) else {
+        let Some((address, _orig_mode)) = self.phase.stop(req_id) else {
             return;
         };
 
@@ -181,7 +195,10 @@ impl DictateApp {
             return;
         };
 
-        self.status_message = "Transcribiendo...".into();
+        self.status_message = match target_mode {
+            DictationMode::Transcription => "Transcribiendo...".into(),
+            DictationMode::Formal => "Redactando formalmente...".into(),
+        };
 
         let pcm = match capture.stop() {
             Ok(bytes) => bytes,
@@ -193,7 +210,7 @@ impl DictateApp {
         };
 
         if !capture_valid(&pcm) {
-            self.status_message = "Audio invalido".into();
+            self.status_message = "Audio demasiado corto".into();
             self.phase = Phase::Error;
             return;
         }
@@ -204,7 +221,10 @@ impl DictateApp {
         let key = self.settings.api_key.clone();
         let model = self.settings.model.clone();
         let temp = self.settings.temperature;
-        let prompt = self.settings.prompt.clone();
+        let prompt = match target_mode {
+            DictationMode::Transcription => self.settings.prompt.clone(),
+            DictationMode::Formal => self.settings.prompt_formal.clone(),
+        };
 
         thread::spawn(move || {
             let res = (|| -> anyhow::Result<String> {
@@ -215,64 +235,106 @@ impl DictateApp {
             let _ = tx.send(UiEvent::TranscriptionFinished {
                 request_id: req_id,
                 address,
+                mode: target_mode,
                 result: res.map_err(|e| e.to_string()),
             });
         });
+    }
+
+    pub fn stop_dictation(&mut self) {
+        let current_mode = match &self.phase {
+            Phase::Recording { mode, .. } => *mode,
+            _ => DictationMode::Transcription,
+        };
+        self.stop_dictation_with_mode(current_mode);
     }
 
     pub fn cancel_dictation(&mut self) {
         if let Some(capture) = self.capture.take() {
             let _ = capture.stop();
         }
+        self.press_start = None;
         self.phase = Phase::Idle;
         self.level.store(0, Ordering::Relaxed);
         self.status_message = "Cancelado".into();
     }
 
-    pub fn toggle_dictation(&mut self) {
-        match self.phase {
-            Phase::Idle | Phase::Error => self.start_dictation(),
-            Phase::Recording(_) => self.stop_dictation(),
-            Phase::Processing(_) => self.cancel_dictation(),
+    pub fn toggle_dictation(&mut self, mode: DictationMode) {
+        match &self.phase {
+            Phase::Idle | Phase::Error => self.start_dictation(mode),
+            Phase::Recording { mode: active_mode, .. } => {
+                let m = *active_mode;
+                self.stop_dictation_with_mode(m);
+            }
+            Phase::Processing { .. } => self.cancel_dictation(),
         }
     }
 
     pub fn process_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                UiEvent::ShortcutDown => {
-                    match self.phase {
+                UiEvent::ShortcutDown(mode) => {
+                    match &self.phase {
                         Phase::Idle | Phase::Error => {
-                            self.start_dictation();
+                            self.press_start = Some(std::time::Instant::now());
+                            self.start_dictation(mode);
                         }
-                        Phase::Processing(_) | Phase::Recording(_) => {
-                            // "y si se vuelve a presionar el atajo, es para cancelar..."
+                        Phase::Recording { mode: active_mode, .. } => {
+                            // If shortcut pressed again while recording, finish and transcribe (toggle behavior)
+                            let target_mode = *active_mode;
+                            self.press_start = None;
+                            self.stop_dictation_with_mode(target_mode);
+                        }
+                        Phase::Processing { .. } => {
                             self.cancel_dictation();
                         }
                     }
                 }
-                UiEvent::ShortcutUp => {
-                    if matches!(self.phase, Phase::Recording(_)) {
-                        self.stop_dictation();
+                UiEvent::ShortcutUp(mode) => {
+                    if let Phase::Recording { mode: active_mode, .. } = &self.phase {
+                        if *active_mode == mode {
+                            if let Some(start) = self.press_start.take() {
+                                // If held for at least 350ms, release completes recording (push-to-talk).
+                                // If released quicker (<350ms), it's treated as a single tap toggle: keeps recording.
+                                if start.elapsed() >= Duration::from_millis(350) {
+                                    self.stop_dictation_with_mode(mode);
+                                }
+                            }
+                        }
+                    }
+                }
+                UiEvent::Cancel => {
+                    if matches!(self.phase, Phase::Recording { .. } | Phase::Processing { .. }) {
+                        self.cancel_dictation();
                     }
                 }
                 UiEvent::IpcCommand(cmd) => match cmd.as_str() {
                     "start" => {
                         if matches!(self.phase, Phase::Idle | Phase::Error) {
-                            self.start_dictation();
-                        } else if matches!(self.phase, Phase::Processing(_)) {
+                            self.start_dictation(DictationMode::Transcription);
+                        } else if matches!(self.phase, Phase::Processing { .. }) {
                             self.cancel_dictation();
-                        } else if matches!(self.phase, Phase::Recording(_)) {
+                        } else if matches!(self.phase, Phase::Recording { .. }) {
                             self.stop_dictation();
                         }
                     }
+                    "start-formal" | "formal" => {
+                        if matches!(self.phase, Phase::Idle | Phase::Error) {
+                            self.start_dictation(DictationMode::Formal);
+                        } else if matches!(self.phase, Phase::Processing { .. }) {
+                            self.cancel_dictation();
+                        } else if matches!(self.phase, Phase::Recording { .. }) {
+                            self.stop_dictation_with_mode(DictationMode::Formal);
+                        }
+                    }
                     "stop" => {
-                        if matches!(self.phase, Phase::Recording(_)) {
+                        if matches!(self.phase, Phase::Recording { .. }) {
                             self.stop_dictation();
                         }
                     }
                     "cancel" => self.cancel_dictation(),
-                    "toggle" => self.toggle_dictation(),
+                    "toggle" => self.toggle_dictation(DictationMode::Transcription),
+                    "toggle-formal" => self.toggle_dictation(DictationMode::Formal),
                     "reset" | "reload" => {
                         self.cancel_dictation();
                         self.status_message = "Reiniciado".into();
@@ -302,15 +364,17 @@ impl DictateApp {
                 UiEvent::TranscriptionFinished {
                     request_id,
                     address,
+                    mode,
                     result,
                 } => {
-                    if self.phase != Phase::Processing(request_id) {
+                    if self.phase != (Phase::Processing { request_id, mode }) {
                         return;
                     }
 
                     match result {
                         Ok(text) => {
-                            let clean = sanitize_plain_text(&text);
+                            let preserve_newlines = mode == DictationMode::Formal;
+                            let clean = sanitize_text(&text, preserve_newlines);
                             if !clean.is_empty() {
                                 let _ = input::restore_focus(&address);
                                 thread::sleep(Duration::from_millis(60));
@@ -336,9 +400,11 @@ impl DictateApp {
     pub fn state_color(&self) -> Color32 {
         match self.phase {
             Phase::Idle => Color32::from_rgb(55, 170, 130),       // Emerald Teal
-            Phase::Recording(_) => Color32::from_rgb(235, 65, 75), // Ruby Red
-            Phase::Processing(_) => Color32::from_rgb(230, 170, 40), // Amber Gold
-            Phase::Error => Color32::from_rgb(160, 75, 210),      // Purple
+            Phase::Recording { mode: DictationMode::Transcription, .. } => Color32::from_rgb(235, 65, 75), // Ruby Red
+            Phase::Recording { mode: DictationMode::Formal, .. } => Color32::from_rgb(75, 135, 245), // Sapphire Blue
+            Phase::Processing { mode: DictationMode::Transcription, .. } => Color32::from_rgb(230, 170, 40), // Amber Gold
+            Phase::Processing { mode: DictationMode::Formal, .. } => Color32::from_rgb(155, 85, 245), // Royal Amethyst
+            Phase::Error => Color32::from_rgb(220, 60, 60),      // Error Red
         }
     }
 
@@ -347,7 +413,7 @@ impl DictateApp {
         let screen_h = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(1) } as f32;
 
         let (w, h) = if self.show_settings {
-            (460.0, 520.0)
+            (470.0, 560.0)
         } else {
             (176.0, 44.0)
         };
@@ -420,7 +486,7 @@ impl eframe::App for DictateApp {
         self.anim_time += dt as f64;
 
         // Smoothly animate carapace expansion/collapse
-        let target_open = if matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)) {
+        let target_open = if matches!(self.phase, Phase::Recording { .. } | Phase::Processing { .. }) {
             1.0
         } else {
             0.0
@@ -437,7 +503,7 @@ impl eframe::App for DictateApp {
         }
 
         // Cancel with Escape key at any time while recording or processing
-        if matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)) {
+        if matches!(self.phase, Phase::Recording { .. } | Phase::Processing { .. }) {
             let esc = (unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x1B) } as u16 & 0x8000) != 0;
             if esc {
                 self.cancel_dictation();
@@ -445,7 +511,7 @@ impl eframe::App for DictateApp {
         }
 
         // Keep animated redraw active when recording, processing, or easing
-        if matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)) || self.open > 0.001 {
+        if matches!(self.phase, Phase::Recording { .. } | Phase::Processing { .. }) || self.open > 0.001 {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
@@ -468,10 +534,10 @@ fn render_original_carapace(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui:
         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
     if response.clicked() {
-        app.toggle_dictation();
+        app.toggle_dictation(DictationMode::Transcription);
     }
     if response.secondary_clicked() {
-        if matches!(app.phase, Phase::Recording(_) | Phase::Processing(_)) {
+        if matches!(app.phase, Phase::Recording { .. } | Phase::Processing { .. }) {
             app.cancel_dictation();
         } else {
             app.show_settings = true;
@@ -479,7 +545,7 @@ fn render_original_carapace(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui:
         }
     }
 
-    let level_f = if matches!(app.phase, Phase::Processing(_)) {
+    let level_f = if matches!(app.phase, Phase::Processing { .. }) {
         -1.0
     } else {
         (app.level.load(Ordering::Relaxed) as f32 / 32768.0).clamp(0.0, 1.0)
@@ -499,7 +565,7 @@ fn render_original_carapace(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui:
 }
 
 fn render_settings_window(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui::Context) {
-    let full_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(460.0, 520.0));
+    let full_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(470.0, 560.0));
     let painter = ui.painter_at(full_rect);
 
     painter.rect_filled(full_rect, 14.0, Color32::from_rgb(16, 20, 28));
@@ -681,58 +747,135 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
 
     ui.add_space(8.0);
 
-    // Shortcut Selector
-    ui.label(egui::RichText::new("Atajo de Teclado:").color(Color32::from_rgb(170, 180, 195)));
-    let old_sc = app.settings.shortcut.clone();
-    egui::ComboBox::from_label("Atajo")
-        .selected_text(if app.settings.shortcut.is_empty() {
-            "Desactivado"
-        } else {
-            &app.settings.shortcut
-        })
-        .show_ui(ui, |ui| {
-            for &sc in &shortcut::PRESET_SHORTCUTS {
-                let label = if sc.is_empty() { "Desactivado" } else { sc };
-                ui.selectable_value(&mut app.settings.shortcut, sc.into(), label);
+    // Shortcut Selectors & Prompts for Both Modes
+    ui.separator();
+    ui.add_space(4.0);
+
+    // MODE 1: STANDARD TRANSCRIPTION
+    ui.label(
+        egui::RichText::new("Modo 1: Transcripción (Dictado fiel)")
+            .strong()
+            .color(Color32::from_rgb(235, 100, 110)),
+    );
+    ui.label(
+        egui::RichText::new("Transcribe exactamente lo dicho, corrigiendo titubeos, muletillas y signos.")
+            .size(11.0)
+            .color(Color32::from_rgb(130, 140, 155)),
+    );
+
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Atajo Dictado:").color(Color32::from_rgb(170, 180, 195)));
+        let old_sc = app.settings.shortcut.clone();
+        egui::ComboBox::from_id_salt("combo_shortcut_dictate")
+            .selected_text(if app.settings.shortcut.is_empty() {
+                "Desactivado"
+            } else {
+                &app.settings.shortcut
+            })
+            .show_ui(ui, |ui| {
+                for &sc in &shortcut::PRESET_SHORTCUTS {
+                    let label = if sc.is_empty() { "Desactivado" } else { sc };
+                    ui.selectable_value(&mut app.settings.shortcut, sc.into(), label);
+                }
+            });
+
+        if old_sc != app.settings.shortcut {
+            app.sync_shortcut();
+        }
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Prompt de Transcripción:").color(Color32::from_rgb(170, 180, 195)));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button(egui::RichText::new("Restablecer por defecto").size(11.0)).clicked() {
+                app.settings.prompt = settings::DEFAULT_PROMPT.into();
             }
         });
+    });
+    ui.add(
+        egui::TextEdit::multiline(&mut app.settings.prompt)
+            .desired_rows(4)
+            .desired_width(f32::INFINITY),
+    );
 
-    if old_sc != app.settings.shortcut {
-        app.sync_shortcut();
-    }
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(4.0);
 
-    ui.small("Presiona y manten pulsado para hablar. Al soltar transcribe. Presiona de nuevo para cancelar.");
+    // MODE 2: FORMAL REDACTION
+    ui.label(
+        egui::RichText::new("Modo 2: Redacción Formal (Asistente Ejecutivo)")
+            .strong()
+            .color(Color32::from_rgb(100, 160, 255)),
+    );
+    ui.label(
+        egui::RichText::new("Escucha tus notas o ideas y redacta un texto formal, profesional y elegante.")
+            .size(11.0)
+            .color(Color32::from_rgb(130, 140, 155)),
+    );
 
-    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Atajo Formal:").color(Color32::from_rgb(170, 180, 195)));
+        let old_scf = app.settings.shortcut_formal.clone();
+        egui::ComboBox::from_id_salt("combo_shortcut_formal")
+            .selected_text(if app.settings.shortcut_formal.is_empty() {
+                "Desactivado"
+            } else {
+                &app.settings.shortcut_formal
+            })
+            .show_ui(ui, |ui| {
+                for &sc in &shortcut::PRESET_SHORTCUTS {
+                    let label = if sc.is_empty() { "Desactivado" } else { sc };
+                    ui.selectable_value(&mut app.settings.shortcut_formal, sc.into(), label);
+                }
+            });
+
+        if old_scf != app.settings.shortcut_formal {
+            app.sync_shortcut();
+        }
+    });
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Prompt Formal:").color(Color32::from_rgb(170, 180, 195)));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button(egui::RichText::new("Restablecer por defecto").size(11.0)).clicked() {
+                app.settings.prompt_formal = settings::DEFAULT_PROMPT_FORMAL.into();
+            }
+        });
+    });
+    ui.add(
+        egui::TextEdit::multiline(&mut app.settings.prompt_formal)
+            .desired_rows(4)
+            .desired_width(f32::INFINITY),
+    );
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(4.0);
 
     // Autostart with Windows
     if ui
         .checkbox(
             &mut app.settings.autostart,
-            "Iniciar automaticamente con Windows",
+            "Iniciar automáticamente con Windows",
         )
         .changed()
     {
         let _ = crate::autostart::set_autostart(app.settings.autostart);
     }
 
-    ui.add_space(8.0);
+    ui.add_space(6.0);
 
     // Temperature
-    ui.label(egui::RichText::new("Temperatura de IA:").color(Color32::from_rgb(170, 180, 195)));
-    ui.add(egui::Slider::new(&mut app.settings.temperature, 0.0..=1.0).text("Precision"));
+    ui.label(egui::RichText::new("Temperatura de IA (Precisión / Creatividad):").color(Color32::from_rgb(170, 180, 195)));
+    ui.add(egui::Slider::new(&mut app.settings.temperature, 0.0..=1.0).text("Precisión"));
 
-    ui.add_space(8.0);
+    ui.add_space(6.0);
+    ui.small("Tip: Puedes mantener presionado el atajo para hablar y soltarlo para transcribir, o presionarlo una vez para iniciar y otra para finalizar. Pulsa Escape para cancelar.");
 
-    // System Prompt
-    ui.label(egui::RichText::new("Prompt de Transcripcion:").color(Color32::from_rgb(170, 180, 195)));
-    ui.add(
-        egui::TextEdit::multiline(&mut app.settings.prompt)
-            .desired_rows(3)
-            .desired_width(f32::INFINITY),
-    );
-
-    ui.add_space(12.0);
+    ui.add_space(14.0);
 
     if ui
         .button(egui::RichText::new("Guardar cambios").strong().color(Color32::from_rgb(240, 245, 255)))
@@ -743,7 +886,7 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         if let Err(e) = app.settings.save() {
             app.status_message = format!("Error al guardar: {e}");
         } else {
-            app.status_message = "Cambios guardados con exito".into();
+            app.status_message = "Cambios guardados con éxito".into();
         }
     }
 }

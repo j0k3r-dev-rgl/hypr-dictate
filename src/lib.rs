@@ -3,27 +3,43 @@ pub mod settings;
 pub mod api;
 pub mod input;
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum DictationMode {
+    Transcription,
+    Formal,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Phase {
     Idle,
-    Recording(String),
-    Processing(u64),
+    Recording {
+        address: String,
+        mode: DictationMode,
+    },
+    Processing {
+        request_id: u64,
+        mode: DictationMode,
+    },
     Error,
 }
 
 impl Phase {
-    pub fn start(&mut self, address: &str) -> bool {
+    pub fn start(&mut self, address: &str, mode: DictationMode) -> bool {
         if !matches!(self, Self::Idle | Self::Error) || !valid_address(address) {
             return false;
         }
-        *self = Self::Recording(address.into());
+        *self = Self::Recording {
+            address: address.into(),
+            mode,
+        };
         true
     }
-    pub fn stop(&mut self, request_id: u64) -> Option<String> {
-        if let Self::Recording(address) = self {
+    pub fn stop(&mut self, request_id: u64) -> Option<(String, DictationMode)> {
+        if let Self::Recording { address, mode } = self {
             let address = address.clone();
-            *self = Self::Processing(request_id);
-            Some(address)
+            let mode = *mode;
+            *self = Self::Processing { request_id, mode };
+            Some((address, mode))
         } else {
             None
         }
@@ -63,17 +79,38 @@ pub fn capture_valid(pcm: &[u8]) -> bool {
         && pcm.len().is_multiple_of(2)
 }
 
-pub fn sanitize_plain_text(text: &str) -> String {
+pub fn sanitize_text(text: &str, preserve_newlines: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_space = false;
+    let mut consecutive_newlines = 0;
+
     for ch in text.chars() {
-        let mapped = if matches!(ch, '\n' | '\r' | '\t') {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' {
+            if preserve_newlines {
+                if consecutive_newlines < 2 {
+                    out.push('\n');
+                    consecutive_newlines += 1;
+                    prev_space = false;
+                }
+            } else if !prev_space && !out.is_empty() {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        consecutive_newlines = 0;
+
+        let mapped = if ch == '\t' {
             ' '
         } else if ch.is_control() {
             continue;
         } else {
             ch
         };
+
         if mapped == ' ' {
             if !prev_space && !out.is_empty() {
                 out.push(' ');
@@ -84,7 +121,11 @@ pub fn sanitize_plain_text(text: &str) -> String {
             prev_space = false;
         }
     }
-    out.trim_end().to_owned()
+    out.trim().to_owned()
+}
+
+pub fn sanitize_plain_text(text: &str) -> String {
+    sanitize_text(text, false)
 }
 
 #[cfg(test)]
@@ -143,6 +184,14 @@ mod tests {
         assert_eq!(
             sanitize_plain_text("Hola\nmundo\tbonito\r\n"),
             "Hola mundo bonito"
+        );
+    }
+
+    #[test]
+    fn formal_text_sanitization_preserves_paragraphs() {
+        assert_eq!(
+            sanitize_text("Estimado Juan:\n\nEspero te encuentres bien.\r\nSaludos.", true),
+            "Estimado Juan:\n\nEspero te encuentres bien.\nSaludos."
         );
     }
 

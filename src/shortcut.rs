@@ -1,17 +1,29 @@
 use crate::ui::UiEvent;
 use eframe::egui;
+use hypr_dictate::DictationMode;
 use std::sync::{Arc, RwLock, mpsc::Sender};
 use std::thread;
 use std::time::Duration;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 
-pub const PRESET_SHORTCUTS: [&str; 8] = [
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShortcutSettings {
+    pub standard: String,
+    pub formal: String,
+    pub hold_to_talk: bool,
+}
+
+pub const PRESET_SHORTCUTS: [&str; 12] = [
     "",
     "F9",
     "F10",
     "F8",
+    "F11",
+    "F12",
     "CTRL + SHIFT + D",
+    "CTRL + SHIFT + F",
     "CTRL + ALT + D",
+    "CTRL + ALT + F",
     "SUPER + SHIFT + D",
     "ALT + D",
 ];
@@ -40,6 +52,7 @@ pub fn is_token_down(token: &str) -> bool {
         "F11" => 0x7A,
         "F12" => 0x7B,
         "SPACE" => 0x20,
+        "ESC" | "ESCAPE" => 0x1B,
         s if s.len() == 1 => s.chars().next().unwrap().to_ascii_uppercase() as i32,
         _ => return false,
     };
@@ -57,30 +70,59 @@ pub fn shortcut_held(shortcut: &str) -> bool {
 pub fn spawn_listener(
     tx: Sender<UiEvent>,
     ctx: egui::Context,
-    shared_shortcut: Arc<RwLock<(String, bool)>>,
+    shared_shortcuts: Arc<RwLock<ShortcutSettings>>,
 ) {
     thread::spawn(move || {
-        let mut was_held = false;
+        let mut was_held_std = false;
+        let mut was_held_formal = false;
+        let mut was_held_esc = false;
+
         loop {
             thread::sleep(Duration::from_millis(10));
-            let (shortcut, _) = {
-                let guard = shared_shortcut.read().unwrap();
+            let cfg = {
+                let guard = shared_shortcuts.read().unwrap();
                 guard.clone()
             };
-            if shortcut.trim().is_empty() {
-                was_held = false;
-                continue;
+
+            // 1. ESC key detection to cancel active operations
+            let esc_held = is_token_down("ESC");
+            if esc_held && !was_held_esc {
+                let _ = tx.send(UiEvent::Cancel);
+                ctx.request_repaint();
+            }
+            was_held_esc = esc_held;
+
+            // 2. Standard transcription shortcut
+            if !cfg.standard.trim().is_empty() {
+                let held = shortcut_held(&cfg.standard);
+                if held && !was_held_std {
+                    let _ = tx.send(UiEvent::ShortcutDown(DictationMode::Transcription));
+                    ctx.request_repaint();
+                } else if !held && was_held_std {
+                    let _ = tx.send(UiEvent::ShortcutUp(DictationMode::Transcription));
+                    ctx.request_repaint();
+                }
+                was_held_std = held;
+            } else {
+                was_held_std = false;
             }
 
-            let held = shortcut_held(&shortcut);
-            if held && !was_held {
-                let _ = tx.send(UiEvent::ShortcutDown);
-                ctx.request_repaint();
-            } else if !held && was_held {
-                let _ = tx.send(UiEvent::ShortcutUp);
-                ctx.request_repaint();
+            // 3. Formal redaction shortcut
+            if !cfg.formal.trim().is_empty()
+                && cfg.formal.trim().to_uppercase() != cfg.standard.trim().to_uppercase()
+            {
+                let held = shortcut_held(&cfg.formal);
+                if held && !was_held_formal {
+                    let _ = tx.send(UiEvent::ShortcutDown(DictationMode::Formal));
+                    ctx.request_repaint();
+                } else if !held && was_held_formal {
+                    let _ = tx.send(UiEvent::ShortcutUp(DictationMode::Formal));
+                    ctx.request_repaint();
+                }
+                was_held_formal = held;
+            } else {
+                was_held_formal = false;
             }
-            was_held = held;
         }
     });
 }
