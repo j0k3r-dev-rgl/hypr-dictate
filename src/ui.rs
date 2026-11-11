@@ -515,7 +515,7 @@ impl DictateApp {
                     } else {
                         640.0
                     };
-                    (target_x, 37.0)
+                    (target_x, -1.0)
                 }
                 "Izquierda" => (
                     0.0,

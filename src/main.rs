@@ -43,7 +43,7 @@ fn main() -> Result<()> {
             } else {
                 640
             },
-            37,
+            -1,
         ),
         "Izquierda" => (0, ((screen_h - 44) / 2).max(10)),
         "Derecha" => ((screen_w - 176).max(10), ((screen_h - 44) / 2).max(10)),
