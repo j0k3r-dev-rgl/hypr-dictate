@@ -441,6 +441,37 @@ impl DictateApp {
         }
     }
 
+    pub fn update_window_region(&self, ctx: &egui::Context) {
+        let hwnd = unsafe { find_own_window() };
+        if hwnd.is_null() {
+            return;
+        }
+        unsafe {
+            use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+            let ppp = ctx.pixels_per_point();
+            if self.show_settings {
+                let w = (470.0 * ppp).round() as i32;
+                let h = (560.0 * ppp).round() as i32;
+                let r = (28.0 * ppp).round() as i32;
+                let rgn = CreateRoundRectRgn(0, 0, w, h, r, r);
+                if !rgn.is_null() {
+                    SetWindowRgn(hwnd, rgn, 1);
+                }
+            } else {
+                let pill = paint::pill_dimensions(144.0, 32.0, self.open);
+                let x1 = (pill.min.x * ppp).floor() as i32;
+                let y1 = (pill.min.y * ppp).floor() as i32;
+                let x2 = (pill.max.x * ppp).ceil() as i32;
+                let y2 = (pill.max.y * ppp).ceil() as i32;
+                let r = (pill.height() * ppp).round() as i32;
+                let rgn = CreateRoundRectRgn(x1, y1, x2, y2, r, r);
+                if !rgn.is_null() {
+                    SetWindowRgn(hwnd, rgn, 1);
+                }
+            }
+        }
+    }
+
     pub fn reposition_window(&self, ctx: &egui::Context) {
         let screen_w = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(0) } as f32;
         let screen_h = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(1) } as f32;
@@ -448,7 +479,7 @@ impl DictateApp {
         let (w, h) = if self.show_settings {
             (470.0, 560.0)
         } else {
-            (176.0, 44.0)
+            (144.0, 32.0)
         };
 
         let (x, y) = if self.show_settings {
@@ -462,10 +493,9 @@ impl DictateApp {
                     let target_x = if self.settings.x > 0 && (self.settings.x as f32) < screen_w - 50.0 {
                         self.settings.x as f32
                     } else {
-                        // Positioned to the left of the center date/time (center is screen_w / 2)
-                        ((screen_w / 2.0) - 260.0).max(10.0)
+                        ((screen_w / 2.0) - 300.0).max(10.0)
                     };
-                    (target_x, 0.0)
+                    (target_x, 6.0)
                 }
                 "Izquierda" => (
                     0.0,
@@ -486,8 +516,6 @@ impl DictateApp {
         let hwnd = unsafe { find_own_window() };
         if !hwnd.is_null() {
             unsafe {
-                use windows_sys::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
-                use windows_sys::Win32::UI::Controls::MARGINS;
                 use windows_sys::Win32::UI::WindowsAndMessaging::{
                     GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
                     SWP_FRAMECHANGED, SWP_SHOWWINDOW, WS_POPUP, WS_VISIBLE,
@@ -503,15 +531,6 @@ impl DictateApp {
                     & !((WS_EX_APPWINDOW | WS_EX_WINDOWEDGE) as isize);
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex);
 
-                // Extend DWM frame to make the background 100% transparent glass (no black/square box)
-                let margins = MARGINS {
-                    cxLeftWidth: -1,
-                    cxRightWidth: -1,
-                    cyTopHeight: -1,
-                    cyBottomHeight: -1,
-                };
-                let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-
                 SetWindowPos(
                     hwnd,
                     -1isize as windows_sys::Win32::Foundation::HWND, // HWND_TOPMOST
@@ -526,6 +545,7 @@ impl DictateApp {
 
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(w, h)));
         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::new(x, y)));
+        self.update_window_region(ctx);
     }
 }
 
@@ -546,6 +566,7 @@ impl eframe::App for DictateApp {
         } else {
             0.0
         };
+        let prev_open = self.open;
         if self.open < target_open {
             self.open = (self.open + dt * 8.0).min(target_open);
         } else if self.open > target_open {
@@ -556,6 +577,8 @@ impl eframe::App for DictateApp {
             self.reposition_window(&ctx);
             self.startup_frames += 1;
             ctx.request_repaint();
+        } else if (self.open - prev_open).abs() > 0.0001 && !self.show_settings {
+            self.update_window_region(&ctx);
         }
 
         // Cancel with Escape key at any time while recording or processing
@@ -583,7 +606,7 @@ impl eframe::App for DictateApp {
 }
 
 fn render_original_carapace(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui::Context) {
-    let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(176.0, 44.0));
+    let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(144.0, 32.0));
     let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
     if response.dragged() {
@@ -608,10 +631,10 @@ fn render_original_carapace(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui:
     };
 
     let painter = ui.painter_at(rect);
-    paint::draw_carapace(
+    paint::draw_voice_pill(
         &painter,
-        176.0,
-        44.0,
+        144.0,
+        32.0,
         app.state_color(),
         app.open,
         level_f,
@@ -753,11 +776,11 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         });
         ui.horizontal(|ui| {
             if ui.button(egui::RichText::new("Izquierda de Fecha/Hora (Recomendado)").size(11.0)).clicked() {
-                app.settings.x = ((screen_w / 2) - 260).max(10);
+                app.settings.x = ((screen_w / 2) - 300).max(10);
                 app.reposition_window(ui.ctx());
             }
             if ui.button(egui::RichText::new("Centro").size(11.0)).clicked() {
-                app.settings.x = ((screen_w - 176) / 2).max(10);
+                app.settings.x = ((screen_w - 144) / 2).max(10);
                 app.reposition_window(ui.ctx());
             }
         });

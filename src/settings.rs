@@ -54,8 +54,8 @@ impl Default for Settings {
             model: String::new(),
             base_url: DEFAULT_BASE_URL.into(),
             api_key: std::env::var("CLIPROXYAPI_API_KEY").unwrap_or_default(),
-            x: 700,
-            y: 950,
+            x: 660,
+            y: 6,
             shortcut: "F9".into(),
             shortcut_formal: "F10".into(),
             microphone: String::new(),
@@ -64,7 +64,7 @@ impl Default for Settings {
             prompt_formal: DEFAULT_PROMPT_FORMAL.into(),
             hold_to_talk: true,
             autostart: true,
-            position: "Abajo".into(),
+            position: "Arriba".into(),
         }
     }
 }
