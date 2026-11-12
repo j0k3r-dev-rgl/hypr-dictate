@@ -55,6 +55,7 @@ REGLAS CRÍTICAS:\n\
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub model: String,
+    pub model_formal: String,
     pub base_url: String,
     pub api_key: String,
     pub x: i32,
@@ -63,6 +64,7 @@ pub struct Settings {
     pub shortcut_formal: String,
     pub microphone: String,
     pub temperature: f64,
+    pub temperature_formal: f64,
     pub prompt: String,
     pub prompt_formal: String,
     pub hold_to_talk: bool,
@@ -76,6 +78,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             model: String::new(),
+            model_formal: String::new(),
             base_url: DEFAULT_BASE_URL.into(),
             api_key: std::env::var("CLIPROXYAPI_API_KEY").unwrap_or_default(),
             x: 660,
@@ -84,6 +87,7 @@ impl Default for Settings {
             shortcut_formal: "F10".into(),
             microphone: String::new(),
             temperature: DEFAULT_TEMPERATURE,
+            temperature_formal: DEFAULT_TEMPERATURE,
             prompt: DEFAULT_PROMPT.into(),
             prompt_formal: DEFAULT_PROMPT_FORMAL.into(),
             hold_to_talk: true,
@@ -124,6 +128,11 @@ impl Settings {
         if let Some(m) = v["model"].as_str() {
             s.model = m.into();
         }
+        if let Some(mf) = v["model_formal"].as_str() {
+            s.model_formal = mf.into();
+        } else {
+            s.model_formal = s.model.clone();
+        }
         if let Some(base_url) = v["base_url"].as_str() {
             s.base_url = base_url.into();
         }
@@ -151,6 +160,11 @@ impl Settings {
         }
         if let Some(temp) = v["temperature"].as_f64() {
             s.temperature = temp.clamp(0.0, 1.0);
+        }
+        if let Some(tf) = v["temperature_formal"].as_f64() {
+            s.temperature_formal = tf.clamp(0.0, 1.0);
+        } else {
+            s.temperature_formal = s.temperature;
         }
         let mut upgraded_prompt = false;
         if let Some(prompt) = v["prompt"].as_str()
@@ -201,6 +215,7 @@ impl Settings {
         }
         let json = serde_json::to_string_pretty(&json!({
             "model": self.model,
+            "model_formal": self.model_formal,
             "base_url": self.base_url,
             "api_key": self.api_key,
             "x": self.x,
@@ -209,6 +224,7 @@ impl Settings {
             "shortcut_formal": self.shortcut_formal,
             "microphone": self.microphone,
             "temperature": self.temperature,
+            "temperature_formal": self.temperature_formal,
             "prompt": self.prompt,
             "prompt_formal": self.prompt_formal,
             "hold_to_talk": self.hold_to_talk,

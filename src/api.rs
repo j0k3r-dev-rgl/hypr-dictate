@@ -32,6 +32,23 @@ pub fn api_endpoints(base: Option<&str>) -> Result<(String, String)> {
     Ok((transcription, url.into()))
 }
 
+fn extract_api_error(status: reqwest::StatusCode, body: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<Value>(body)
+        && let Some(msg) = val
+            .get("error")
+            .and_then(|e| e.get("message").or_else(|| e.as_str().map(|_| e)))
+            .and_then(Value::as_str)
+    {
+        return format!("HTTP {status}: {msg}");
+    }
+    let snippet: String = body.trim().chars().take(160).collect();
+    if snippet.is_empty() {
+        format!("La API devolvió código HTTP {status}")
+    } else {
+        format!("HTTP {status}: {snippet}")
+    }
+}
+
 pub fn fetch_catalog(
     client: &reqwest::blocking::Client,
     endpoint: &str,
@@ -41,7 +58,12 @@ pub fn fetch_catalog(
     if !key.is_empty() {
         req = req.bearer_auth(key);
     }
-    let response = req.send()?.error_for_status()?;
+    let response = req.send()?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        anyhow::bail!("{}", extract_api_error(status, &body));
+    }
     let value: Value = response.json()?;
     let models = crate::settings::routes(&value);
     ensure!(!models.is_empty(), "Catálogo de modelos vacío");
@@ -96,11 +118,11 @@ pub fn send_transcription(
         anyhow::anyhow!("Error comunicando con la API: {e}")
     })?;
 
-    ensure!(
-        response.status().is_success(),
-        "La API devolvió código HTTP {}",
-        response.status()
-    );
+    let status = response.status();
+    if !status.is_success() {
+        let err_body = response.text().unwrap_or_default();
+        anyhow::bail!("{}", extract_api_error(status, &err_body));
+    }
 
     let val: Value = response.json().context("Respuesta JSON inválida")?;
 
@@ -108,11 +130,20 @@ pub fn send_transcription(
         anyhow::bail!("Error de API: {err}");
     }
 
-    let text = val["choices"][0]["message"]["content"]
-        .as_str()
-        .context("La API no devolvió transcripción en choices[0].message.content")?
-        .trim()
-        .to_owned();
+    let content = &val["choices"][0]["message"]["content"];
+    let text = if let Some(s) = content.as_str() {
+        s.trim().to_owned()
+    } else if let Some(parts) = content.as_array() {
+        parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("")
+            .trim()
+            .to_owned()
+    } else {
+        anyhow::bail!("La API no devolvió transcripción en choices[0].message.content");
+    };
 
     ensure!(text.len() <= 100_000, "Transcripción demasiado grande");
     Ok(text)
