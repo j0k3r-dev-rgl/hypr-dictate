@@ -52,7 +52,10 @@ impl App {
     pub fn color(&self) -> [u8; 3] {
         match self.phase {
             Phase::Idle => [55, 170, 130],
-            Phase::Recording(_) => [235, 65, 75],
+            Phase::Recording(_) => match self.mode {
+                DictationMode::Transcription => [235, 65, 75],
+                DictationMode::Formal => [65, 140, 235],
+            },
             Phase::Processing(_) => [230, 170, 40],
             Phase::Error => [160, 75, 210],
         }
@@ -786,6 +789,23 @@ mod tests {
                 body["messages"][0]["content"][1]["input_audio"]["format"],
                 "wav"
             );
+        }
+    }
+
+    #[test]
+    fn recording_color_distinguishes_modes_without_changing_other_states() {
+        let mut app = app(Phase::Recording("0xabc".into()));
+        assert_eq!(app.color(), [235, 65, 75]);
+        app.mode = DictationMode::Formal;
+        assert_eq!(app.color(), [65, 140, 235]);
+        for mode in [DictationMode::Transcription, DictationMode::Formal] {
+            app.mode = mode;
+            app.phase = Phase::Idle;
+            assert_eq!(app.color(), [55, 170, 130]);
+            app.phase = Phase::Processing(1);
+            assert_eq!(app.color(), [230, 170, 40]);
+            app.phase = Phase::Error;
+            assert_eq!(app.color(), [160, 75, 210]);
         }
     }
 
