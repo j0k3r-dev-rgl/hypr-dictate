@@ -15,8 +15,8 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-const SETTINGS_W: f32 = 860.0;
-const SETTINGS_H: f32 = 700.0;
+const SETTINGS_W: f32 = 880.0;
+const SETTINGS_H: f32 = 680.0;
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum SettingsTab {
@@ -489,8 +489,9 @@ impl DictateApp {
             if self.show_settings {
                 let w = (SETTINGS_W * ppp).round() as i32;
                 let h = (SETTINGS_H * ppp).round() as i32;
+                let top = (2.0 * ppp).round() as i32;
                 let r = (32.0 * ppp).round() as i32;
-                let rgn = CreateRoundRectRgn(0, 0, w, h, r, r);
+                let rgn = CreateRoundRectRgn(0, top, w, h, r, r);
                 if !rgn.is_null() {
                     SetWindowRgn(hwnd, rgn, 1);
                 }
@@ -584,6 +585,23 @@ impl DictateApp {
                 let new_ex = (ex | (WS_EX_TOOLWINDOW | WS_EX_TOPMOST) as isize)
                     & !((WS_EX_APPWINDOW | WS_EX_WINDOWEDGE) as isize);
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex);
+
+                // Disable DWM non-client border & Windows 11 1px top accent/white line
+                use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+                let no_border: u32 = 0xFFFFFFFE; // DWMWA_COLOR_NONE
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    34, // DWMWA_BORDER_COLOR
+                    &no_border as *const u32 as *const core::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+                let ncrp_disabled: u32 = 1; // DWMNCRP_DISABLED
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    2, // DWMWA_NCRENDERING_POLICY
+                    &ncrp_disabled as *const u32 as *const core::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
 
                 SetWindowPos(
                     hwnd,
@@ -697,17 +715,21 @@ fn render_original_carapace(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui:
     );
 }
 
-const BG_WINDOW: Color32 = Color32::from_rgb(13, 17, 24);
-const BG_CARD: Color32 = Color32::from_rgb(20, 26, 36);
-const BG_SURFACE: Color32 = Color32::from_rgb(27, 34, 48);
-const BG_SURFACE_HOVER: Color32 = Color32::from_rgb(36, 45, 62);
-const BORDER_SUBTLE: Color32 = Color32::from_rgb(38, 48, 66);
-const TEXT_PRIMARY: Color32 = Color32::from_rgb(232, 238, 248);
-const TEXT_SECONDARY: Color32 = Color32::from_rgb(152, 164, 184);
-const TEXT_MUTED: Color32 = Color32::from_rgb(106, 118, 138);
+const BG_WINDOW: Color32 = Color32::from_rgb(11, 15, 23);
+const BG_SIDEBAR: Color32 = Color32::from_rgb(15, 20, 30);
+const BG_CARD: Color32 = Color32::from_rgb(20, 27, 40);
+const BG_INPUT: Color32 = Color32::from_rgb(13, 18, 28);
+const BG_SURFACE: Color32 = Color32::from_rgb(28, 37, 54);
+const BG_SURFACE_HOVER: Color32 = Color32::from_rgb(38, 50, 72);
+const BORDER_SUBTLE: Color32 = Color32::from_rgb(38, 50, 72);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(240, 244, 250);
+const TEXT_SECONDARY: Color32 = Color32::from_rgb(182, 194, 212);
+const TEXT_MUTED: Color32 = Color32::from_rgb(138, 150, 170);
 const ACCENT_EMERALD: Color32 = Color32::from_rgb(55, 175, 135);
-const ACCENT_EMERALD_DARK: Color32 = Color32::from_rgb(32, 118, 90);
-const DANGER_RED: Color32 = Color32::from_rgb(225, 82, 88);
+const ACCENT_EMERALD_DARK: Color32 = Color32::from_rgb(28, 108, 82);
+const ACCENT_BLUE: Color32 = Color32::from_rgb(75, 135, 245);
+const ACCENT_CORAL: Color32 = Color32::from_rgb(235, 85, 95);
+const DANGER_RED: Color32 = Color32::from_rgb(230, 90, 96);
 
 fn configure_theme(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
@@ -715,7 +737,7 @@ fn configure_theme(ctx: &egui::Context) {
     style.spacing.item_spacing = Vec2::new(10.0, 10.0);
     style.spacing.button_padding = Vec2::new(14.0, 7.0);
     style.spacing.interact_size = Vec2::new(40.0, 30.0);
-    style.spacing.slider_width = 220.0;
+    style.spacing.slider_width = 200.0;
     style.spacing.combo_width = 240.0;
 
     let mut v = egui::Visuals::dark();
@@ -723,9 +745,9 @@ fn configure_theme(ctx: &egui::Context) {
     v.window_fill = BG_WINDOW;
     v.panel_fill = BG_WINDOW;
     v.faint_bg_color = BG_CARD;
-    v.extreme_bg_color = Color32::from_rgb(10, 13, 19);
+    v.extreme_bg_color = BG_INPUT;
     v.selection.bg_fill = ACCENT_EMERALD_DARK;
-    v.selection.stroke = Stroke::new(1.0, ACCENT_EMERALD);
+    v.selection.stroke = Stroke::new(1.5, ACCENT_EMERALD);
 
     let cr = egui::CornerRadius::same(8);
     v.window_corner_radius = egui::CornerRadius::same(16);
@@ -746,12 +768,12 @@ fn configure_theme(ctx: &egui::Context) {
     v.widgets.hovered.bg_fill = BG_SURFACE_HOVER;
     v.widgets.hovered.weak_bg_fill = BG_SURFACE_HOVER;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_EMERALD);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.2, TEXT_PRIMARY);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.2, Color32::WHITE);
     v.widgets.hovered.corner_radius = cr;
 
-    v.widgets.active.bg_fill = Color32::from_rgb(42, 54, 74);
-    v.widgets.active.weak_bg_fill = Color32::from_rgb(42, 54, 74);
-    v.widgets.active.bg_stroke = Stroke::new(1.2, ACCENT_EMERALD);
+    v.widgets.active.bg_fill = Color32::from_rgb(44, 58, 84);
+    v.widgets.active.weak_bg_fill = Color32::from_rgb(44, 58, 84);
+    v.widgets.active.bg_stroke = Stroke::new(1.5, ACCENT_EMERALD);
     v.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
     v.widgets.active.corner_radius = cr;
 
@@ -764,10 +786,10 @@ fn section_card(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut e
     egui::Frame::new()
         .fill(BG_CARD)
         .stroke(Stroke::new(1.0, BORDER_SUBTLE))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(12))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
-            let inner_w = (w - 24.0).max(100.0);
+            let inner_w = (w - 32.0).max(100.0);
             ui.vertical(|ui| {
                 ui.set_min_width(inner_w);
                 ui.set_max_width(inner_w);
@@ -778,225 +800,443 @@ fn section_card(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut e
         });
 }
 
-fn tab_button(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> egui::Response {
-    let fill = if active {
-        Color32::from_rgb(28, 48, 46)
+fn draw_nav_icon(painter: &egui::Painter, center: Pos2, tab: SettingsTab, color: Color32) {
+    let stroke = Stroke::new(1.5, color);
+    match tab {
+        SettingsTab::General => {
+            // Sliders icon (two horizontal lines with knobs)
+            painter.line_segment(
+                [Pos2::new(center.x - 6.0, center.y - 3.0), Pos2::new(center.x + 6.0, center.y - 3.0)],
+                stroke,
+            );
+            painter.circle_filled(Pos2::new(center.x - 2.0, center.y - 3.0), 2.2, color);
+            painter.line_segment(
+                [Pos2::new(center.x - 6.0, center.y + 3.0), Pos2::new(center.x + 6.0, center.y + 3.0)],
+                stroke,
+            );
+            painter.circle_filled(Pos2::new(center.x + 2.5, center.y + 3.0), 2.2, color);
+        }
+        SettingsTab::Ai => {
+            // Spark / diamond node icon
+            let r = 5.5;
+            let pts = vec![
+                Pos2::new(center.x, center.y - r),
+                Pos2::new(center.x + r, center.y),
+                Pos2::new(center.x, center.y + r),
+                Pos2::new(center.x - r, center.y),
+            ];
+            painter.add(egui::Shape::closed_line(pts, stroke));
+            painter.circle_filled(center, 1.8, color);
+        }
+        SettingsTab::Server => {
+            // Stacked server bars
+            for dy in [-3.5_f32, 3.5_f32] {
+                let rect = Rect::from_center_size(Pos2::new(center.x, center.y + dy), Vec2::new(12.0, 4.5));
+                painter.rect_stroke(rect, 1.5, stroke, egui::StrokeKind::Inside);
+                painter.circle_filled(Pos2::new(center.x - 3.0, center.y + dy), 1.0, color);
+            }
+        }
+    }
+}
+
+fn sidebar_nav_item(
+    ui: &mut egui::Ui,
+    label: &str,
+    tab: SettingsTab,
+    active: bool,
+) -> egui::Response {
+    let desired = Vec2::new(ui.available_width(), 38.0);
+    let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    let bg = if active {
+        Color32::from_rgba_unmultiplied(55, 175, 135, 28)
+    } else if resp.hovered() {
+        Color32::from_rgba_unmultiplied(255, 255, 255, 10)
     } else {
         Color32::TRANSPARENT
     };
-    let stroke = if active {
-        Stroke::new(1.0, ACCENT_EMERALD)
+
+    ui.painter().rect_filled(rect, 8.0, bg);
+    if active {
+        let pill = Rect::from_min_size(
+            Pos2::new(rect.left() + 2.0, rect.top() + 8.0),
+            Vec2::new(3.0, rect.height() - 16.0),
+        );
+        ui.painter().rect_filled(pill, 1.5, ACCENT_EMERALD);
+    }
+
+    let fg = if active {
+        TEXT_PRIMARY
+    } else if resp.hovered() {
+        TEXT_PRIMARY
     } else {
-        Stroke::NONE
+        TEXT_SECONDARY
     };
-    let text_color = if active { ACCENT_EMERALD } else { TEXT_SECONDARY };
-    ui.add(
-        egui::Button::new(egui::RichText::new(label).size(13.0).strong().color(text_color))
-            .fill(fill)
-            .stroke(stroke)
-            .corner_radius(egui::CornerRadius::same(8))
-            .min_size(Vec2::new(width, 32.0)),
-    )
+    let icon_col = if active { ACCENT_EMERALD } else { TEXT_MUTED };
+
+    draw_nav_icon(
+        ui.painter(),
+        Pos2::new(rect.left() + 22.0, rect.center().y),
+        tab,
+        icon_col,
+    );
+
+    ui.painter().text(
+        Pos2::new(rect.left() + 40.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        fg,
+    );
+
+    resp
 }
 
 fn render_settings_window(app: &mut DictateApp, ui: &mut egui::Ui, ctx: &egui::Context) {
-    let full_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(SETTINGS_W, SETTINGS_H));
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        && matches!(app.phase, Phase::Idle | Phase::Error)
+    {
+        app.show_settings = false;
+        app.reposition_window(ctx);
+        return;
+    }
+
+    let full_rect = Rect::from_min_size(Pos2::new(0.0, 2.0), Vec2::new(SETTINGS_W, SETTINGS_H - 2.0));
     let painter = ui.painter_at(full_rect);
 
     painter.rect_filled(full_rect, 16.0, BG_WINDOW);
+
+    let sidebar_w = 204.0;
+    let sidebar_rect = Rect::from_min_size(Pos2::new(0.0, 2.0), Vec2::new(sidebar_w, SETTINGS_H - 2.0));
+    painter.rect_filled(
+        sidebar_rect,
+        egui::CornerRadius {
+            nw: 16,
+            sw: 16,
+            ne: 0,
+            se: 0,
+        },
+        BG_SIDEBAR,
+    );
+    painter.line_segment(
+        [Pos2::new(sidebar_w, 2.0), Pos2::new(sidebar_w, SETTINGS_H)],
+        Stroke::new(1.0, BORDER_SUBTLE),
+    );
+
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        // LEFT SIDEBAR
+        ui.allocate_ui_with_layout(
+            Vec2::new(sidebar_w, SETTINGS_H),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(14, 18))
+                    .show(ui, |ui| {
+                        ui.set_min_height(SETTINGS_H - 36.0);
+                        ui.set_max_width(sidebar_w - 28.0);
+
+                        // Draggable Brand Header
+                        let brand_resp = ui.horizontal(|ui| {
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(12.0, 12.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot_rect.center(), 4.5, app.state_color());
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.label(
+                                    egui::RichText::new("HyprDictate")
+                                        .size(15.5)
+                                        .strong()
+                                        .color(TEXT_PRIMARY),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Voz a texto")
+                                        .size(11.0)
+                                        .color(TEXT_MUTED),
+                                );
+                            });
+                        });
+                        let drag_brand = ui.interact(
+                            brand_resp.response.rect,
+                            ui.scope_id().with("sidebar_brand_drag"),
+                            egui::Sense::drag(),
+                        );
+                        if drag_brand.dragged() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+
+                        ui.add_space(20.0);
+
+                        if sidebar_nav_item(
+                            ui,
+                            "General",
+                            SettingsTab::General,
+                            app.active_tab == SettingsTab::General,
+                        )
+                        .clicked()
+                        {
+                            app.active_tab = SettingsTab::General;
+                        }
+                        ui.add_space(2.0);
+                        if sidebar_nav_item(
+                            ui,
+                            "Modelos e IA",
+                            SettingsTab::Ai,
+                            app.active_tab == SettingsTab::Ai,
+                        )
+                        .clicked()
+                        {
+                            app.active_tab = SettingsTab::Ai;
+                        }
+                        ui.add_space(2.0);
+                        if sidebar_nav_item(
+                            ui,
+                            "Servidor API",
+                            SettingsTab::Server,
+                            app.active_tab == SettingsTab::Server,
+                        )
+                        .clicked()
+                        {
+                            app.active_tab = SettingsTab::Server;
+                        }
+
+                        // Spacer pushes bottom controls to bottom of sidebar
+                        let used = 210.0;
+                        let push_down = (SETTINGS_H - 36.0 - used - 108.0).max(16.0);
+                        ui.add_space(push_down);
+
+                        ui.separator();
+                        ui.add_space(6.0);
+
+                        // Status badge
+                        let status_col = if app.status_message.starts_with("Error") {
+                            DANGER_RED
+                        } else if app.status_message.contains("guardad")
+                            || app.status_message == "Listo"
+                        {
+                            ACCENT_EMERALD
+                        } else {
+                            TEXT_SECONDARY
+                        };
+                        ui.horizontal(|ui| {
+                            let (sdot, _) =
+                                ui.allocate_exact_size(Vec2::new(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(sdot.center(), 3.5, status_col);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&app.status_message)
+                                        .size(11.5)
+                                        .color(status_col),
+                                )
+                                .truncate(),
+                            );
+                        });
+
+                        ui.add_space(6.0);
+
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Salir de la app")
+                                        .size(12.0)
+                                        .color(DANGER_RED),
+                                )
+                                .fill(Color32::from_rgb(36, 20, 26))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(86, 40, 46)))
+                                .min_size(Vec2::new(ui.available_width(), 32.0)),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            std::process::exit(0);
+                        }
+                    });
+            },
+        );
+
+        // RIGHT MAIN CONTENT
+        let main_w = SETTINGS_W - sidebar_w;
+        ui.allocate_ui_with_layout(
+            Vec2::new(main_w, SETTINGS_H),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(22, 18))
+                    .show(ui, |ui| {
+                        let inner_w = main_w - 44.0;
+                        ui.set_min_width(inner_w);
+                        ui.set_max_width(inner_w);
+
+                        // Top Page Header (drag area strictly between title and button)
+                        let (page_title, page_sub) = match app.active_tab {
+                            SettingsTab::General => (
+                                "General",
+                                "Posición del dock, micrófono, inicio automático y atajos globales.",
+                            ),
+                            SettingsTab::Ai => (
+                                "Modelos e IA",
+                                "Configura modelo, temperatura y prompt independiente para cada modo.",
+                            ),
+                            SettingsTab::Server => (
+                                "Servidor API",
+                                "Conecta cualquier endpoint compatible con OpenAI (/v1/chat/completions).",
+                            ),
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.label(
+                                    egui::RichText::new(page_title)
+                                        .size(18.0)
+                                        .strong()
+                                        .color(TEXT_PRIMARY),
+                                );
+                                ui.label(
+                                    egui::RichText::new(page_sub)
+                                        .size(12.0)
+                                        .color(TEXT_MUTED),
+                                );
+                            });
+
+                            let drag_w = (ui.available_width() - 134.0).max(16.0);
+                            let drag_resp = ui
+                                .allocate_response(Vec2::new(drag_w, 38.0), egui::Sense::drag());
+                            if drag_resp.dragged() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Volver al dock")
+                                                    .size(12.5)
+                                                    .color(TEXT_PRIMARY),
+                                            )
+                                            .fill(BG_SURFACE)
+                                            .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+                                            .min_size(Vec2::new(120.0, 32.0)),
+                                        )
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        app.show_settings = false;
+                                        app.reposition_window(ctx);
+                                    }
+                                },
+                            );
+                        });
+
+                        ui.add_space(10.0);
+
+                        // Scrollable Body: measure remaining height dynamically so footer never clips
+                        let footer_reserve = 56.0;
+                        let scroll_h = (ui.available_height() - footer_reserve).max(180.0);
+                        ui.allocate_ui(Vec2::new(inner_w, scroll_h), |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(scroll_h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    match app.active_tab {
+                                        SettingsTab::General => render_general_tab(app, ui),
+                                        SettingsTab::Ai => render_ai_tab(app, ui),
+                                        SettingsTab::Server => render_server_tab(app, ui),
+                                    }
+                                    ui.add_space(4.0);
+                                });
+                        });
+
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        // Bottom Action Bar
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Esc para volver al dock")
+                                    .size(11.5)
+                                    .color(TEXT_MUTED),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("Guardar cambios")
+                                                    .size(12.5)
+                                                    .strong()
+                                                    .color(Color32::WHITE),
+                                            )
+                                            .fill(ACCENT_EMERALD_DARK)
+                                            .stroke(Stroke::new(1.0, ACCENT_EMERALD))
+                                            .min_size(Vec2::new(136.0, 32.0)),
+                                        )
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        app.sync_shortcut();
+                                        let _ = crate::autostart::set_autostart(
+                                            app.settings.autostart,
+                                        );
+                                        if let Err(e) = app.settings.save() {
+                                            app.status_message = format!("Error al guardar: {e}");
+                                        } else {
+                                            app.status_message = "Cambios guardados".into();
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    });
+            },
+        );
+    });
+
+    // Crisp outer border on top of both panels
     painter.rect_stroke(
         full_rect.shrink(0.5),
         16.0,
         Stroke::new(1.0, BORDER_SUBTLE),
         egui::StrokeKind::Inside,
     );
-
-    egui::Frame::new().inner_margin(egui::Margin::same(20)).show(ui, |ui| {
-        ui.set_width(SETTINGS_W - 40.0);
-        ui.set_height(SETTINGS_H - 40.0);
-
-        // Header with dedicated drag handle that NEVER overlaps the button
-        ui.horizontal(|ui| {
-            let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), egui::Sense::hover());
-            ui.painter().circle_filled(dot_rect.center(), 4.5, app.state_color());
-
-            ui.label(
-                egui::RichText::new("HyprDictate")
-                    .size(17.0)
-                    .strong()
-                    .color(TEXT_PRIMARY),
-            );
-            ui.label(
-                egui::RichText::new("· Configuración")
-                    .size(13.5)
-                    .color(TEXT_MUTED),
-            );
-
-            // Empty spacer between title and button acts as the drag handle
-            let btn_reserve = 132.0;
-            let drag_w = (ui.available_width() - btn_reserve).max(20.0);
-            let drag_resp = ui.allocate_response(Vec2::new(drag_w, 30.0), egui::Sense::drag());
-            if drag_resp.dragged() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Volver al dock")
-                                .size(12.5)
-                                .color(TEXT_PRIMARY),
-                        )
-                        .fill(BG_SURFACE)
-                        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
-                        .corner_radius(egui::CornerRadius::same(8))
-                        .min_size(Vec2::new(118.0, 30.0)),
-                    )
-                    .clicked()
-                {
-                    app.show_settings = false;
-                    app.reposition_window(ctx);
-                }
-            });
-        });
-
-        ui.add_space(12.0);
-
-        // Segmented Tab Bar
-        egui::Frame::new()
-            .fill(BG_CARD)
-            .stroke(Stroke::new(1.0, BORDER_SUBTLE))
-            .corner_radius(egui::CornerRadius::same(10))
-            .inner_margin(egui::Margin::same(4))
-            .show(ui, |ui| {
-                let inner_w = ui.available_width();
-                let tab_w = ((inner_w - 20.0) / 3.0).max(100.0);
-                ui.horizontal(|ui| {
-                    if tab_button(ui, "General", app.active_tab == SettingsTab::General, tab_w).clicked() {
-                        app.active_tab = SettingsTab::General;
-                    }
-                    if tab_button(ui, "Modelo e IA", app.active_tab == SettingsTab::Ai, tab_w).clicked() {
-                        app.active_tab = SettingsTab::Ai;
-                    }
-                    if tab_button(ui, "Servidor API", app.active_tab == SettingsTab::Server, tab_w).clicked() {
-                        app.active_tab = SettingsTab::Server;
-                    }
-                });
-            });
-
-        ui.add_space(12.0);
-
-        // Scrollable Content Area (reserve exact space for sticky footer)
-        let footer_h = 68.0;
-        let scroll_h = (ui.available_height() - footer_h).max(120.0);
-        ui.allocate_ui(Vec2::new(ui.available_width(), scroll_h), |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(scroll_h)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    match app.active_tab {
-                        SettingsTab::General => render_general_tab(app, ui),
-                        SettingsTab::Ai => render_ai_tab(app, ui),
-                        SettingsTab::Server => render_server_tab(app, ui),
-                    }
-                    ui.add_space(6.0);
-                });
-        });
-
-        ui.add_space(4.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        // Sticky Footer
-        ui.horizontal(|ui| {
-            let status_col = if app.status_message.starts_with("Error") {
-                DANGER_RED
-            } else if app.status_message.contains("guardad") || app.status_message == "Listo" {
-                ACCENT_EMERALD
-            } else {
-                TEXT_SECONDARY
-            };
-            let (sdot, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), egui::Sense::hover());
-            ui.painter().circle_filled(sdot.center(), 3.5, status_col);
-            ui.label(
-                egui::RichText::new(&app.status_message)
-                    .size(11.5)
-                    .color(status_col),
-            );
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Guardar")
-                                .size(12.5)
-                                .strong()
-                                .color(Color32::WHITE),
-                        )
-                        .fill(ACCENT_EMERALD_DARK)
-                        .stroke(Stroke::new(1.0, ACCENT_EMERALD))
-                        .corner_radius(egui::CornerRadius::same(8)),
-                    )
-                    .clicked()
-                {
-                    app.sync_shortcut();
-                    let _ = crate::autostart::set_autostart(app.settings.autostart);
-                    if let Err(e) = app.settings.save() {
-                        app.status_message = format!("Error al guardar: {e}");
-                    } else {
-                        app.status_message = "Cambios guardados".into();
-                    }
-                }
-
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Salir app")
-                                .size(12.0)
-                                .color(DANGER_RED),
-                        )
-                        .fill(Color32::from_rgb(38, 22, 26))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(90, 42, 46)))
-                        .corner_radius(egui::CornerRadius::same(8)),
-                    )
-                    .clicked()
-                {
-                    std::process::exit(0);
-                }
-            });
-        });
-    });
 }
 
 fn render_server_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
-    section_card(ui, "API compatible con OpenAI", |ui| {
-        ui.label(
-            egui::RichText::new(
-                "Conecta con CLIProxyAPI, OpenAI, OpenRouter, Groq o cualquier servidor /v1/chat/completions.",
-            )
-            .size(11.5)
-            .color(TEXT_MUTED),
-        );
-        ui.add_space(6.0);
+    let is_loading = app.catalog_status.starts_with("Cargando");
 
-        ui.label(egui::RichText::new("URL Base del Servidor").size(12.0).color(TEXT_SECONDARY));
+    section_card(ui, "Endpoint OpenAI-compatible", |ui| {
+        ui.label(
+            egui::RichText::new("URL Base del Servidor")
+                .size(12.5)
+                .color(TEXT_SECONDARY),
+        );
         ui.add(
             egui::TextEdit::singleline(&mut app.settings.base_url)
                 .desired_width(f32::INFINITY)
-                .hint_text("http://127.0.0.1:8317"),
+                .hint_text("http://127.0.0.1:8317/v1"),
         );
         ui.label(
-            egui::RichText::new("Ej: http://127.0.0.1:8317  ·  https://api.openai.com/v1")
-                .size(11.0)
+            egui::RichText::new("Incluye la ruta base (ej: http://127.0.0.1:8317/v1 o https://api.openai.com/v1).")
+                .size(11.5)
                 .color(TEXT_MUTED),
         );
 
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
-        ui.label(egui::RichText::new("Clave API (Bearer Token)").size(12.0).color(TEXT_SECONDARY));
+        ui.label(
+            egui::RichText::new("Clave API (Bearer Token)")
+                .size(12.5)
+                .color(TEXT_SECONDARY),
+        );
         ui.horizontal(|ui| {
-            let edit_w = (ui.available_width() - 78.0).max(160.0);
+            let edit_w = (ui.available_width() - 88.0).max(160.0);
             if app.show_api_key {
                 ui.add(
                     egui::TextEdit::singleline(&mut app.settings.api_key)
@@ -1013,7 +1253,11 @@ fn render_server_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
             }
 
             if ui
-                .button(if app.show_api_key { "Ocultar" } else { "Mostrar" })
+                .add(
+                    egui::Button::new(if app.show_api_key { "Ocultar" } else { "Mostrar" })
+                        .min_size(Vec2::new(78.0, 30.0)),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
                 app.show_api_key = !app.show_api_key;
@@ -1021,20 +1265,28 @@ fn render_server_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         });
     });
 
-    ui.add_space(10.0);
+    ui.add_space(12.0);
 
     section_card(ui, "Conexión y catálogo", |ui| {
         ui.horizontal(|ui| {
+            let btn_label = if is_loading {
+                "Cargando modelos..."
+            } else {
+                "Guardar y probar conexión"
+            };
             if ui
-                .add(
+                .add_enabled(
+                    !is_loading,
                     egui::Button::new(
-                        egui::RichText::new("Guardar y recargar modelos")
+                        egui::RichText::new(btn_label)
                             .strong()
                             .color(Color32::WHITE),
                     )
                     .fill(ACCENT_EMERALD_DARK)
-                    .stroke(Stroke::new(1.0, ACCENT_EMERALD)),
+                    .stroke(Stroke::new(1.0, ACCENT_EMERALD))
+                    .min_size(Vec2::new(190.0, 32.0)),
                 )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
                 .clicked()
             {
                 app.models.clear();
@@ -1045,20 +1297,19 @@ fn render_server_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                     app.refresh_catalog();
                 }
             }
-        });
 
-        if !app.catalog_status.is_empty() {
-            ui.add_space(6.0);
-            let is_ok = app.catalog_status.starts_with("Conectado");
-            let col = if is_ok {
-                ACCENT_EMERALD
-            } else if app.catalog_status.starts_with("Cargando") {
-                TEXT_SECONDARY
-            } else {
-                DANGER_RED
-            };
-            ui.label(egui::RichText::new(&app.catalog_status).color(col).size(12.0));
-        }
+            if !app.catalog_status.is_empty() {
+                let is_ok = app.catalog_status.starts_with("Conectado");
+                let col = if is_ok {
+                    ACCENT_EMERALD
+                } else if is_loading {
+                    TEXT_SECONDARY
+                } else {
+                    DANGER_RED
+                };
+                ui.label(egui::RichText::new(&app.catalog_status).color(col).size(12.5));
+            }
+        });
     });
 }
 
@@ -1068,6 +1319,7 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Borde:").size(12.5).color(TEXT_SECONDARY));
             egui::ComboBox::from_id_salt("combo_dock_pos")
+                .width(160.0)
                 .selected_text(&app.settings.position)
                 .show_ui(ui, |ui| {
                     for &pos in &settings::DOCK_POSITIONS {
@@ -1090,8 +1342,11 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                 {
                     app.reposition_window(ui.ctx());
                 }
+            });
+            ui.horizontal(|ui| {
                 if ui
                     .button(egui::RichText::new("Izquierda de Fecha/Hora").size(11.5))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
                     app.settings.x = 640;
@@ -1099,6 +1354,7 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                 }
                 if ui
                     .button(egui::RichText::new("Centrar").size(11.5))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
                     app.settings.x = ((screen_w - 176) / 2).max(10);
@@ -1108,7 +1364,7 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         }
     });
 
-    ui.add_space(8.0);
+    ui.add_space(10.0);
 
     section_card(ui, "Audio e inicio", |ui| {
         ui.horizontal(|ui| {
@@ -1119,7 +1375,7 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
                 &app.settings.microphone
             };
             egui::ComboBox::from_id_salt("combo_microphone")
-                .width(290.0)
+                .width(360.0)
                 .selected_text(mic_label)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
@@ -1149,63 +1405,77 @@ fn render_general_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         }
     });
 
-    ui.add_space(8.0);
+    ui.add_space(10.0);
 
     section_card(ui, "Atajos globales", |ui| {
+        let gap = 14.0;
+        let col_w = ((ui.available_width() - gap) / 2.0).floor().max(180.0);
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Dictado fiel:")
-                    .size(12.5)
-                    .color(Color32::from_rgb(235, 115, 125)),
-            );
-            let old_sc = app.settings.shortcut.clone();
-            egui::ComboBox::from_id_salt("combo_shortcut_dictate")
-                .selected_text(if app.settings.shortcut.is_empty() {
-                    "Desactivado"
-                } else {
-                    &app.settings.shortcut
-                })
-                .show_ui(ui, |ui| {
-                    for &sc in &shortcut::PRESET_SHORTCUTS {
-                        let label = if sc.is_empty() { "Desactivado" } else { sc };
-                        ui.selectable_value(&mut app.settings.shortcut, sc.into(), label);
+            ui.allocate_ui_with_layout(
+                Vec2::new(col_w, 34.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let (d, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(d.center(), 3.5, ACCENT_CORAL);
+                    ui.label(egui::RichText::new("Dictado:").size(12.5).color(TEXT_SECONDARY));
+                    let old_sc = app.settings.shortcut.clone();
+                    egui::ComboBox::from_id_salt("combo_shortcut_dictate")
+                        .width(160.0)
+                        .selected_text(if app.settings.shortcut.is_empty() {
+                            "Desactivado"
+                        } else {
+                            &app.settings.shortcut
+                        })
+                        .show_ui(ui, |ui| {
+                            for &sc in &shortcut::PRESET_SHORTCUTS {
+                                let label = if sc.is_empty() { "Desactivado" } else { sc };
+                                ui.selectable_value(&mut app.settings.shortcut, sc.into(), label);
+                            }
+                        });
+                    if old_sc != app.settings.shortcut {
+                        app.sync_shortcut();
                     }
-                });
-            if old_sc != app.settings.shortcut {
-                app.sync_shortcut();
-            }
+                },
+            );
+            ui.add_space(gap);
+            ui.allocate_ui_with_layout(
+                Vec2::new(col_w, 34.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let (d, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(d.center(), 3.5, ACCENT_BLUE);
+                    ui.label(egui::RichText::new("Formal:").size(12.5).color(TEXT_SECONDARY));
+                    let old_scf = app.settings.shortcut_formal.clone();
+                    egui::ComboBox::from_id_salt("combo_shortcut_formal")
+                        .width(160.0)
+                        .selected_text(if app.settings.shortcut_formal.is_empty() {
+                            "Desactivado"
+                        } else {
+                            &app.settings.shortcut_formal
+                        })
+                        .show_ui(ui, |ui| {
+                            for &sc in &shortcut::PRESET_SHORTCUTS {
+                                let label = if sc.is_empty() { "Desactivado" } else { sc };
+                                ui.selectable_value(
+                                    &mut app.settings.shortcut_formal,
+                                    sc.into(),
+                                    label,
+                                );
+                            }
+                        });
+                    if old_scf != app.settings.shortcut_formal {
+                        app.sync_shortcut();
+                    }
+                },
+            );
         });
 
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Redacción formal:")
-                    .size(12.5)
-                    .color(Color32::from_rgb(115, 175, 255)),
-            );
-            let old_scf = app.settings.shortcut_formal.clone();
-            egui::ComboBox::from_id_salt("combo_shortcut_formal")
-                .selected_text(if app.settings.shortcut_formal.is_empty() {
-                    "Desactivado"
-                } else {
-                    &app.settings.shortcut_formal
-                })
-                .show_ui(ui, |ui| {
-                    for &sc in &shortcut::PRESET_SHORTCUTS {
-                        let label = if sc.is_empty() { "Desactivado" } else { sc };
-                        ui.selectable_value(&mut app.settings.shortcut_formal, sc.into(), label);
-                    }
-                });
-            if old_scf != app.settings.shortcut_formal {
-                app.sync_shortcut();
-            }
-        });
-
-        ui.add_space(2.0);
+        ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
-                "Mantén pulsado para hablar y suelta para transcribir, o pulsa una vez para iniciar y otra para terminar. Escape cancela.",
+                "Mantén pulsado para hablar y suelta para transcribir, o pulsa una vez para iniciar y otra para terminar.",
             )
-            .size(11.0)
+            .size(11.5)
             .color(TEXT_MUTED),
         );
     });
@@ -1253,11 +1523,15 @@ fn render_model_picker(
         selected_model.as_str()
     };
     egui::ComboBox::from_id_salt(id_salt)
-        .width(avail.max(180.0))
+        .width(avail.max(160.0))
         .selected_text(display)
         .show_ui(ui, |ui| {
             if filtered.is_empty() {
-                ui.label(egui::RichText::new("Sin coincidencias").size(11.5).color(TEXT_MUTED));
+                ui.label(
+                    egui::RichText::new("Sin coincidencias")
+                        .size(11.5)
+                        .color(TEXT_MUTED),
+                );
             } else {
                 for m in filtered {
                     ui.selectable_value(selected_model, m.clone(), m.as_str());
@@ -1269,6 +1543,7 @@ fn render_model_picker(
 fn render_mode_card(
     ui: &mut egui::Ui,
     title: &str,
+    accent: Color32,
     id_salt: &str,
     models: &[String],
     selected_model: &mut String,
@@ -1278,59 +1553,102 @@ fn render_mode_card(
     prompt: &mut String,
     default_prompt: &str,
 ) {
-    section_card(ui, title, |ui| {
-        ui.style_mut().spacing.slider_width = 180.0;
+    let w = ui.available_width();
+    egui::Frame::new()
+        .fill(BG_CARD)
+        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            let inner_w = (w - 28.0).max(120.0);
+            ui.vertical(|ui| {
+                ui.set_min_width(inner_w);
+                ui.set_max_width(inner_w);
+                ui.style_mut().spacing.slider_width = (inner_w - 135.0).max(110.0);
 
-        render_model_picker(ui, id_salt, models, selected_model, filter, hint);
+                ui.horizontal(|ui| {
+                    let (dot, _) =
+                        ui.allocate_exact_size(Vec2::new(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.5, accent);
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(13.5)
+                            .strong()
+                            .color(TEXT_PRIMARY),
+                    );
+                });
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Temperatura:").size(12.0).color(TEXT_SECONDARY));
-            ui.add(egui::Slider::new(temperature, 0.0..=1.0).step_by(0.05));
-        });
+                ui.add_space(6.0);
+                render_model_picker(ui, id_salt, models, selected_model, filter, hint);
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Prompt:").size(12.0).color(TEXT_SECONDARY));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(egui::RichText::new("Restablecer").size(11.0)).clicked() {
-                    *prompt = default_prompt.to_owned();
-                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Temperatura:")
+                            .size(12.0)
+                            .color(TEXT_SECONDARY),
+                    );
+                    ui.add(egui::Slider::new(temperature, 0.0..=1.0).step_by(0.05));
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Prompt:").size(12.0).color(TEXT_SECONDARY));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(egui::RichText::new("Restablecer").size(11.5))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            *prompt = default_prompt.to_owned();
+                        }
+                    });
+                });
+
+                let text_w = (ui.available_width() - 14.0).max(120.0);
+                egui::ScrollArea::vertical()
+                    .id_salt(format!("{id_salt}_prompt_scroll"))
+                    .max_height(195.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(prompt)
+                                .desired_rows(9)
+                                .desired_width(text_w),
+                        );
+                    });
             });
         });
-
-        let text_w = ui.available_width();
-        egui::ScrollArea::vertical()
-            .id_salt(format!("{id_salt}_prompt_scroll"))
-            .max_height(235.0)
-            .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(prompt)
-                        .desired_rows(11)
-                        .desired_width(text_w),
-                );
-            });
-    });
 }
 
 fn render_ai_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
+    let is_loading = app.catalog_status.starts_with("Cargando");
+
     section_card(ui, "Catálogo de modelos", |ui| {
         ui.horizontal(|ui| {
             if !app.models.is_empty() {
                 ui.label(
-                    egui::RichText::new(format!("{} modelos cargados", app.models.len()))
-                        .size(12.0)
+                    egui::RichText::new(format!("{} modelos disponibles", app.models.len()))
+                        .size(12.5)
                         .color(ACCENT_EMERALD),
                 );
             } else {
                 ui.label(
-                    egui::RichText::new("Sin catálogo: escribe el ID del modelo manualmente o recarga.")
-                        .size(11.5)
+                    egui::RichText::new("Sin catálogo: escribe el ID manualmente o recarga.")
+                        .size(12.0)
                         .color(TEXT_MUTED),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Recargar modelos").clicked() {
+                let label = if is_loading {
+                    "Cargando..."
+                } else {
+                    "Recargar modelos"
+                };
+                if ui
+                    .add_enabled(!is_loading, egui::Button::new(label))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
                     app.refresh_catalog();
                 }
             });
@@ -1340,17 +1658,20 @@ fn render_ai_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
     ui.add_space(10.0);
 
     let gap = 12.0;
-    let total_w = ui.available_width();
-    let col_w = ((total_w - gap) / 2.0).floor().max(260.0);
+    let total_w = (ui.available_width() - 14.0).max(480.0);
+    let col_w = ((total_w - gap) / 2.0).floor().max(230.0);
 
     ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
         ui.allocate_ui_with_layout(
-            Vec2::new(col_w, 430.0),
+            Vec2::new(col_w, 385.0),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
                 render_mode_card(
                     ui,
                     "Modo 1 · Transcripción",
+                    ACCENT_CORAL,
                     "combo_model_transcription",
                     &app.models,
                     &mut app.settings.model,
@@ -1364,12 +1685,14 @@ fn render_ai_tab(app: &mut DictateApp, ui: &mut egui::Ui) {
         );
         ui.add_space(gap);
         ui.allocate_ui_with_layout(
-            Vec2::new(col_w, 430.0),
+            Vec2::new(col_w, 385.0),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
                 render_mode_card(
                     ui,
-                    "Modo 2 · Redacción Formal",
+                    "Modo 2 · Asistente de Redacción",
+                    ACCENT_BLUE,
                     "combo_model_formal",
                     &app.models,
                     &mut app.settings.model_formal,

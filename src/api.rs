@@ -7,13 +7,8 @@ use std::time::Duration;
 pub fn api_endpoints(base: Option<&str>) -> Result<(String, String)> {
     let base = base.unwrap_or(crate::settings::DEFAULT_BASE_URL);
     let trimmed = base.trim().trim_end_matches('/');
-    let clean = if trimmed.ends_with("/v1") {
-        trimmed.strip_suffix("/v1").unwrap_or(trimmed).trim_end_matches('/')
-    } else {
-        trimmed
-    };
 
-    let mut url = reqwest::Url::parse(clean)
+    let mut url = reqwest::Url::parse(trimmed)
         .map_err(|_| anyhow::anyhow!("La URL del servidor no es válida"))?;
     ensure!(
         matches!(url.scheme(), "http" | "https")
@@ -26,9 +21,9 @@ pub fn api_endpoints(base: Option<&str>) -> Result<(String, String)> {
     );
 
     let path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(&format!("{path}/v1/chat/completions"));
+    url.set_path(&format!("{path}/chat/completions"));
     let transcription = url.to_string();
-    url.set_path(&format!("{path}/v1/models"));
+    url.set_path(&format!("{path}/models"));
     Ok((transcription, url.into()))
 }
 
