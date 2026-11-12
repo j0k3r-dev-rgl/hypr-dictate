@@ -32,6 +32,42 @@ pub struct OutputItem {
     pub output: wl_output::WlOutput,
 }
 
+const PASTE_KEYMAP: &str = "xkb_keymap { xkb_keycodes \"paste\" { minimum = 8; maximum = 255; <LCTL> = 37; <V> = 55; }; xkb_types \"paste\" { type \"ONE_LEVEL\" { modifiers = None; level_name[Level1] = \"Any\"; }; }; xkb_compatibility \"paste\" { interpret Control_L { action = SetMods(modifiers=Control); }; }; xkb_symbols \"paste\" { key <LCTL> { [ Control_L ] }; key <V> { [ v ] }; modifier_map Control { <LCTL> }; }; };\0";
+
+fn clipboard_paste(
+    text: &str,
+    mut check_focus: impl FnMut() -> Result<()>,
+    copy: impl FnOnce(&str) -> Result<()>,
+    paste: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    check_focus()?;
+    copy(text)?;
+    check_focus()?;
+    paste()
+}
+
+fn write_clipboard(text: &str, command: &mut std::process::Command) -> Result<()> {
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("No se pudo iniciar wl-copy para pegar el texto")?;
+    let written = child
+        .stdin
+        .take()
+        .context("No se pudo abrir la entrada de wl-copy")?
+        .write_all(text.as_bytes());
+    let status = child.wait().context("No se pudo esperar a wl-copy")?;
+    written.context("No se pudo copiar el texto al portapapeles")?;
+    ensure!(
+        status.success(),
+        "No se pudo copiar el texto al portapapeles; no se pegó texto"
+    );
+    Ok(())
+}
+
 fn memory_file() -> Result<File> {
     let fd = unsafe { libc::memfd_create(c"hypr-dictate".as_ptr(), libc::MFD_CLOEXEC) };
     ensure!(
@@ -352,8 +388,16 @@ impl Ui {
         self.layer = Some(layer);
         self.dirty = true;
     }
-    pub fn type_text(&mut self, text: &str, address: &str) -> Result<()> {
-        let cleaned = hypr_dictate::sanitize_plain_text(text);
+    pub fn type_text(
+        &mut self,
+        text: &str,
+        address: &str,
+        mode: hypr_dictate::DictationMode,
+    ) -> Result<()> {
+        let cleaned = match mode {
+            hypr_dictate::DictationMode::Formal => hypr_dictate::sanitize_redaction_text(text),
+            hypr_dictate::DictationMode::Transcription => hypr_dictate::sanitize_plain_text(text),
+        };
         if cleaned.is_empty() {
             return Ok(());
         }
@@ -364,6 +408,14 @@ impl Ui {
                 break;
             }
             std::thread::sleep(Duration::from_millis(15));
+        }
+        ensure!(
+            !crate::shortcut::any_modifier_held(),
+            "Suelta los modificadores antes de insertar; no se insertó texto"
+        );
+        let xwayland = crate::active_target_uses_xwayland(address)?;
+        if hypr_dictate::insertion_uses_clipboard(mode, xwayland) {
+            return self.paste_text(&cleaned, address);
         }
         let keyboard = self.keyboard.as_ref().unwrap();
         let all_chars: Vec<char> = cleaned.chars().collect();
@@ -412,6 +464,50 @@ impl Ui {
             cursor = end;
         }
         Ok(())
+    }
+    fn paste_text(&self, text: &str, address: &str) -> Result<()> {
+        let keyboard = self
+            .keyboard
+            .as_ref()
+            .context("Teclado virtual no disponible")?;
+        let mut file = memory_file()?;
+        file.write_all(PASTE_KEYMAP.as_bytes())?;
+        file.seek(SeekFrom::Start(0))?;
+        keyboard.keymap(1, file.as_fd(), PASTE_KEYMAP.len() as u32);
+        keyboard.modifiers(0, 0, 0, 0);
+        self.connection.roundtrip()?;
+        clipboard_paste(
+            text,
+            || {
+                ensure!(
+                    crate::active_address()? == address,
+                    "Cambió el foco antes de pegar; no se pegó texto"
+                );
+                ensure!(
+                    !crate::shortcut::any_modifier_held(),
+                    "Suelta los modificadores antes de pegar"
+                );
+                Ok(())
+            },
+            |text| {
+                write_clipboard(
+                    text,
+                    std::process::Command::new("wl-copy")
+                        .args(["--type", "text/plain;charset=utf-8"]),
+                )
+            },
+            || {
+                // Physical Ctrl/V positions also work when XWayland ignores our Unicode keymap.
+                keyboard.key(0, 29, 1);
+                keyboard.modifiers(4, 0, 0, 0);
+                keyboard.key(0, 47, 1);
+                keyboard.key(0, 47, 0);
+                keyboard.key(0, 29, 0);
+                keyboard.modifiers(0, 0, 0, 0);
+                self.connection.flush()?;
+                Ok(())
+            },
+        )
     }
 }
 impl Dispatch<wl_registry::WlRegistry, ()> for Ui {
@@ -795,6 +891,86 @@ mod tests {
             app.event(Event::Command(command.into()), &mut ui);
             assert_eq!(app.mode, hypr_dictate::DictationMode::Formal);
         }
+    }
+
+    #[test]
+    fn clipboard_paste_checks_focus_before_copy_and_again_before_pasting() {
+        let operations = std::cell::RefCell::new(Vec::new());
+        clipboard_paste(
+            "Nota con ñ 🙂",
+            || {
+                operations.borrow_mut().push("focus");
+                Ok(())
+            },
+            |text| {
+                assert_eq!(text, "Nota con ñ 🙂");
+                operations.borrow_mut().push("copy");
+                Ok(())
+            },
+            || {
+                operations.borrow_mut().push("paste");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*operations.borrow(), ["focus", "copy", "focus", "paste"]);
+        let mut checks = 0;
+        assert!(
+            clipboard_paste(
+                "text",
+                || {
+                    checks += 1;
+                    ensure!(checks == 1, "focus changed");
+                    Ok(())
+                },
+                |_| Ok(()),
+                || panic!("must not paste after focus changed")
+            )
+            .is_err()
+        );
+        assert!(
+            clipboard_paste(
+                "text",
+                || Ok(()),
+                |_| anyhow::bail!("copy failed"),
+                || panic!("must not paste after copy failed")
+            )
+            .is_err()
+        );
+        assert!(
+            clipboard_paste(
+                "text",
+                || anyhow::bail!("wrong target"),
+                |_| panic!("must not copy for wrong target"),
+                || panic!("must not paste")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn clipboard_writer_sends_utf8_over_stdin_and_propagates_failure() {
+        let text = "Solicitud: equipos, ñ, tildes y 🙂\n\n\tDos equipos";
+        let mut reader = std::process::Command::new("python3");
+        reader.args(["-c", "import sys; assert sys.stdin.buffer.read().decode('utf-8') == 'Solicitud: equipos, ñ, tildes y 🙂\\n\\n\\tDos equipos'"]);
+        write_clipboard(text, &mut reader).unwrap();
+        assert!(write_clipboard(text, &mut std::process::Command::new("false")).is_err());
+        assert!(
+            write_clipboard(
+                text,
+                &mut std::process::Command::new("/nonexistent/hypr-dictate-wl-copy")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn paste_keymap_uses_only_ctrl_and_v_without_text_or_enter_keys() {
+        assert!(PASTE_KEYMAP.ends_with('\0'));
+        assert!(PASTE_KEYMAP.contains("<LCTL> = 37"));
+        assert!(PASTE_KEYMAP.contains("<V> = 55"));
+        assert!(!PASTE_KEYMAP.contains("Return"));
+        assert!(!PASTE_KEYMAP.contains("Tab"));
     }
 
     #[test]

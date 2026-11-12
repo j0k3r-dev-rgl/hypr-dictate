@@ -191,6 +191,7 @@ impl App {
         let model = self.settings.model_for(self.mode).to_owned();
         let temperature = self.settings.temperature;
         let prompt = self.settings.prompt_for(self.mode).to_owned();
+        let mode = self.mode;
         thread::spawn(move || {
             let result = (|| -> Result<(String, String)> {
                 let status = capture.child.wait()?;
@@ -243,11 +244,14 @@ impl App {
                     response["choices"][0]["finish_reason"] == "stop",
                     "Respuesta incompleta; no se insertó texto"
                 );
-                let text = response["choices"][0]["message"]["content"]
+                let content = response["choices"][0]["message"]["content"]
                     .as_str()
-                    .context("API sin transcripción")?
-                    .trim()
-                    .to_owned();
+                    .context("API sin transcripción")?;
+                let text = match mode {
+                    DictationMode::Formal => content,
+                    DictationMode::Transcription => content.trim(),
+                }
+                .to_owned();
                 ensure!(text.len() <= 100_000, "Transcripción demasiado grande");
                 Ok((address, text))
             })();
@@ -442,9 +446,10 @@ impl App {
                 Ok(())
             })(),
             Event::Finished(request_id, result) => {
+                let mode = self.mode;
                 self.finish(request_id, result, |address, text| {
                     restore(address)?;
-                    ui.type_text(text, address)
+                    ui.type_text(text, address, mode)
                 })
             }
         };
@@ -461,7 +466,7 @@ impl Drop for App {
 }
 fn api_endpoints(base: Option<&str>) -> Result<(String, String)> {
     let base = base.unwrap_or(settings::DEFAULT_BASE_URL);
-    let mut url = reqwest::Url::parse(base)
+    let mut url = reqwest::Url::parse(base.trim())
         .map_err(|_| anyhow::anyhow!("La URL del servidor no es válida"))?;
     ensure!(
         matches!(url.scheme(), "http" | "https")
@@ -473,10 +478,9 @@ fn api_endpoints(base: Option<&str>) -> Result<(String, String)> {
         "La URL del servidor debe usar HTTP o HTTPS, sin credenciales, parámetros ni fragmentos"
     );
     let path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(&format!("{path}/v1/chat/completions"));
+    url.set_path(&format!("{path}/chat/completions"));
     let transcription = url.to_string();
-    url.set_path(&format!("{path}/v1/models"));
-    url.set_query(Some("client_version=1"));
+    url.set_path(&format!("{path}/models"));
     Ok((transcription, url.into()))
 }
 fn fetch_catalog(
@@ -560,6 +564,19 @@ fn hypr(args: &[&str]) -> Result<Vec<u8>> {
 fn active_address() -> Result<String> {
     let value: Value = serde_json::from_slice(&hypr(&["-j", "activewindow"])?)?;
     Ok(value["address"].as_str().unwrap_or("").into())
+}
+fn target_uses_xwayland(window: &Value, address: &str) -> Result<bool> {
+    ensure!(
+        valid_address(address) && window["address"].as_str() == Some(address),
+        "Cambió el foco antes de insertar; no se insertó texto"
+    );
+    window["xwayland"]
+        .as_bool()
+        .context("No se pudo identificar el tipo de ventana destino")
+}
+fn active_target_uses_xwayland(address: &str) -> Result<bool> {
+    let window: Value = serde_json::from_slice(&hypr(&["-j", "activewindow"])?)?;
+    target_uses_xwayland(&window, address)
 }
 fn restore(address: &str) -> Result<()> {
     ensure!(valid_address(address), "Destino inválido");
@@ -755,8 +772,7 @@ mod tests {
                     .unwrap();
                 let mut body = vec![0; length];
                 socket.read_exact(&mut body).unwrap();
-                let response =
-                    r#"{"choices":[{"finish_reason":"stop","message":{"content":"Texto final"}}]}"#;
+                let response = r#"{"choices":[{"finish_reason":"stop","message":{"content":"\tAsunto: Recursos\n\nTexto final\n\tFirma"}}]}"#;
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
                 serde_json::from_slice::<Value>(&body).unwrap()
             });
@@ -782,7 +798,11 @@ mod tests {
                 panic!("expected transcription result");
             };
             assert_eq!(id, 3);
-            assert_eq!(result.unwrap(), ("0xabc".into(), "Texto final".into()));
+            let expected = match mode {
+                DictationMode::Formal => "\tAsunto: Recursos\n\nTexto final\n\tFirma",
+                DictationMode::Transcription => "Asunto: Recursos\n\nTexto final\n\tFirma",
+            };
+            assert_eq!(result.unwrap(), ("0xabc".into(), expected.into()));
             let body = server.join().unwrap();
             assert_eq!(body["model"], app.settings.model_for(mode));
             assert_eq!(
@@ -812,6 +832,24 @@ mod tests {
             assert_eq!(app.phase, Phase::Idle);
             assert!(app.capture.is_none());
         }
+    }
+
+    #[test]
+    fn insertion_route_requires_the_original_target_and_an_explicit_window_type() {
+        assert!(
+            target_uses_xwayland(&json!({"address":"0xabc", "xwayland":true}), "0xabc").unwrap()
+        );
+        assert!(
+            !target_uses_xwayland(&json!({"address":"0xabc", "xwayland":false}), "0xabc").unwrap()
+        );
+        assert!(
+            target_uses_xwayland(&json!({"address":"0xdef", "xwayland":true}), "0xabc").is_err()
+        );
+        assert!(target_uses_xwayland(&json!({"address":"0xabc"}), "0xabc").is_err());
+        assert!(
+            target_uses_xwayland(&json!({"address":"invalid", "xwayland":true}), "invalid")
+                .is_err()
+        );
     }
 
     #[test]
@@ -879,7 +917,7 @@ mod tests {
         assert_eq!(format!("{:?}", app.settings), format!("{expected:?}"));
         assert_eq!(
             app.endpoint,
-            "https://proxy.example/service/v1/chat/completions"
+            "https://proxy.example/service/chat/completions"
         );
     }
 
@@ -952,19 +990,39 @@ mod tests {
     }
 
     #[test]
-    fn api_urls_use_default_or_configured_http_and_https_base() {
+    fn api_urls_preserve_the_exact_provider_base_without_inserting_a_version() {
         for (base, root) in [
             (None, "http://127.0.0.1:8317"),
             (Some("http://127.0.0.1:9000/"), "http://127.0.0.1:9000"),
             (Some("https://proxy.example"), "https://proxy.example"),
+            (
+                Some("https://provider.example/api"),
+                "https://provider.example/api",
+            ),
+            (
+                Some("https://provider.example/v2/"),
+                "https://provider.example/v2",
+            ),
+            (
+                Some("https://api.openai.com/v1"),
+                "https://api.openai.com/v1",
+            ),
+            (
+                Some("https://proxy.example/service/v1/"),
+                "https://proxy.example/service/v1",
+            ),
+            (
+                Some("  https://proxy.example/v1/  "),
+                "https://proxy.example/v1",
+            ),
             (
                 Some("https://proxy.example/service/"),
                 "https://proxy.example/service",
             ),
         ] {
             let (transcription, catalog) = api_endpoints(base).unwrap();
-            assert_eq!(transcription, format!("{root}/v1/chat/completions"));
-            assert_eq!(catalog, format!("{root}/v1/models?client_version=1"));
+            assert_eq!(transcription, format!("{root}/chat/completions"));
+            assert_eq!(catalog, format!("{root}/models"));
         }
     }
 
@@ -1041,8 +1099,8 @@ mod tests {
         assert_eq!(
             server.join().unwrap(),
             [
-                "GET /proxy/v1/models?client_version=1 HTTP/1.1",
-                "POST /proxy/v1/chat/completions HTTP/1.1",
+                "GET /proxy/models HTTP/1.1",
+                "POST /proxy/chat/completions HTTP/1.1",
             ]
         );
     }

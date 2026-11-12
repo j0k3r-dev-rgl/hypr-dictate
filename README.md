@@ -1,10 +1,10 @@
 # hypr-dictate
 
-Dictado ligero para Hyprland: graba, envía una petición a CLIProxyAPI y escribe la transcripción completa en la ventana enfocada al comenzar. Rust y Wayland nativo, sin navegador ni historial; la inserción del dictado no usa el portapapeles.
+Dictado ligero para Hyprland: graba, envía una petición a un servidor OpenAI-compatible con entrada de audio y escribe el resultado en la ventana enfocada al comenzar. Rust y Wayland nativo, sin navegador ni historial; el dictado usa teclado virtual en Wayland y pegado por portapapeles en XWayland; la redacción siempre usa pegado para conservar la estructura del texto.
 
 ## Compilar y ejecutar
 
-Requiere Rust, `pkg-config` y las bibliotecas de desarrollo de GTK4 para compilar. En ejecución: GTK4, un tema de iconos simbólicos (por ejemplo, Adwaita), Hyprland con layer-shell y teclado virtual, PipeWire, `pw-record` y `hyprctl`.
+Requiere Rust, `pkg-config` y las bibliotecas de desarrollo de GTK4 para compilar. En ejecución: GTK4, un tema de iconos simbólicos (por ejemplo, Adwaita), Hyprland con layer-shell y teclado virtual, PipeWire, `pw-record` y `hyprctl`. Para redacción y para dictado en aplicaciones XWayland, como ONLYOFFICE, también se requiere `wl-copy`.
 
 ```bash
 cargo build --release
@@ -42,15 +42,19 @@ Ejecuta `hyprctl reload` y cierra y vuelve a abrir los ajustes para aplicar la r
 La aplicación puede arrancar sin exportar ninguna clave. Configura servidor y autenticación desde la interfaz:
 
 1. Abre los ajustes con clic derecho y entra en **Servidor y API key**.
-2. Edita la URL base de CLIProxyAPI; por defecto es **`http://127.0.0.1:8317`**.
+2. Edita la URL base del servidor OpenAI-compatible; por defecto es **`http://127.0.0.1:8317`**. Puedes usar, por ejemplo, `https://api.openai.com/v1` u otro proveedor compatible con entrada de audio.
 3. Desmarca **Usar CLIPROXYAPI_API_KEY** e introduce la clave. El campo la oculta y permite verla con el icono del ojo. Si el servidor no requiere autenticación, déjala vacía.
 4. Pulsa **Guardar servidor y API key**. Se guardan en `settings.json` y se recarga el catálogo sin reiniciar, aunque el servidor anterior esté caído. No aplica otros cambios pendientes de la ventana. Cerrar sin guardar descarta la edición.
 
 Si mantienes marcada **Usar CLIPROXYAPI_API_KEY**, se usa la variable heredada al arrancar (si existe) y no se copia su valor al archivo. Una clave manual, incluso vacía, tiene prioridad sobre la variable. La misma clave se usa para el catálogo y las transcripciones; guardar cambios generales no aplica una clave pendiente de guardar.
 
-Se añaden `/v1/chat/completions` para transcribir y `/v1/models?client_version=1` para el catálogo. La base admite HTTP o HTTPS, una barra final opcional y un prefijo de ruta (por ejemplo, `https://proxy.example.com/cliproxy`); no incluyas `/v1`, credenciales, parámetros ni fragmentos. Una URL vacía o inválida no se guarda. No se usa una variable de entorno para la dirección.
+Se respeta la URL base exacta del proveedor: solo se añaden `/chat/completions` para procesar el audio y `/models` para el catálogo, con autenticación Bearer si introduces una clave. **No se añade ni se elimina `/v1` automáticamente.** Por ejemplo, `https://proveedor.example/api` consulta `/api/models` y `/api/chat/completions`; `https://api.openai.com/v1` consulta `/v1/models` y `/v1/chat/completions`. Si tu servidor local requiere `/v1`, inclúyelo explícitamente: `http://127.0.0.1:8317/v1`.
 
-Los ajustes anteriores sin `base_url` usan localhost. Una URL ya guardada se conserva. No se puede cambiar el servidor mientras se graba o procesa un dictado.
+La URL admite HTTP o HTTPS, una barra final opcional y cualquier prefijo de ruta del proveedor. No incluyas credenciales, parámetros ni fragmentos. Una URL vacía o inválida no se guarda. No se usa una variable de entorno para la dirección.
+
+El proveedor y el modelo deben aceptar contenido `input_audio` (WAV) en Chat Completions. Un servidor compatible solo con chat de texto, Responses o `/audio/transcriptions` no basta. El catálogo no garantiza que todos los modelos listados acepten audio.
+
+Los ajustes anteriores sin `base_url` usan localhost. Una URL ya guardada se conserva sin migración: revisa que incluya la ruta base completa que exige tu proveedor. No se puede cambiar el servidor mientras se graba o procesa un dictado.
 
 En **General** hay un único desplegable con búsqueda por función: **Modelo de dictado** y **Modelo de redacción profesional**. Cada uno muestra el catálogo completo con la ruta `cuenta/modelo`, sin selector de cuenta ni filtros por cuenta. Puedes elegir rutas distintas, siempre del mismo servidor y con la misma API key. Ambos modelos deben admitir entrada de audio.
 
@@ -65,7 +69,9 @@ Los prompts ya guardados no se sustituyen automáticamente al actualizar. Para u
 
 En **General**, activa **Redacción profesional al usar el dock** para usar ese modo con el botón del dock o `toggle`. También puedes configurar un **Atajo de redacción profesional** independiente del atajo de dictado; ambos empiezan desactivados en ajustes nuevos. Cada atajo mantiene su modo durante toda la grabación. En **Prompts e IA** puedes editar ambos prompts por separado; **Restaurar valores** los restaura en el borrador. Pulsa **Guardar cambios** para aplicar estas opciones.
 
-La inserción de ambos modos sigue siendo texto plano en una sola línea: los saltos de línea se convierten en espacios por seguridad, nunca en pulsaciones de Enter.
+La **redacción** conserva saltos de línea, párrafos, tabulaciones y sangrías como texto plano. Siempre se pega por portapapeles, también en Wayland: no se simulan pulsaciones de Enter o Tab. El prompt admite notas, informes, solicitudes administrativas, ideas y publicaciones, adaptando la estructura al encargo sin inventar fechas, firmantes ni otros datos. Pide títulos normales y listas numeradas, sin Markdown; la limpieza también elimina marcadores habituales de encabezados, énfasis, citas, viñetas y bloques de código, conservando el contenido y las comillas legítimas. No es un conversor completo de Markdown ni genera formato enriquecido, tablas de procesador de textos o estilos de fuente.
+
+El **dictado** mantiene el texto en una sola línea, convirtiendo saltos de línea y tabulaciones en espacios. Usa inserción directa en Wayland y pegado en XWayland.
 
 ## Atajos de mantener para hablar
 
@@ -90,10 +96,11 @@ Suelta la tecla principal antes que los modificadores para que coincida el bindi
 - Al parar, envía una petición sin reintentos automáticos. El timeout total de transcripción es de 120 segundos e incluye subida, procesamiento del servidor y lectura de la respuesta; la conexión tiene un límite de 5 segundos. El catálogo mantiene un timeout total de 25 segundos y de conexión de 5 segundos. Si se agota el tiempo de transcripción, se informa como tal. La espera depende del servidor y la duración del audio; las pruebas previas de fragmentos cortos rondaron tres segundos, no tiempo real.
 - Antes de insertar, comprueba que la ventana original sigue existiendo, la enfoca y verifica el foco. Si ya no existe, no escribe en otra ventana.
 - Conserva la ventana, no la posición interna del cursor. No cambies de campo durante la petición. Las comprobaciones de foco reducen el riesgo, pero no son atómicas con la escritura: evita cambiar de ventana durante la inserción.
-- **Primera prueba en un editor vacío, nunca en una terminal:** la inserción simula teclas y su interpretación depende de la aplicación. Los saltos de línea y tabulaciones se convierten en espacios y los demás caracteres de control se eliminan; no se envían como Enter ni Tab.
+- **Primera prueba en un editor vacío, nunca en una terminal:** la interpretación del texto y del pegado depende de la aplicación. El dictado convierte saltos de línea y tabulaciones en espacios. La redacción los conserva mediante pegado, pero elimina los demás caracteres de control; no simula Enter ni Tab. Pegar texto multilínea en una terminal puede ejecutar comandos; un chat puede interpretar el pegado según sus propias reglas.
 - Una sola grabación activa. Cancelar durante «Procesando» descarta el resultado y permite comenzar otra grabación, pero la petición HTTP anterior puede seguir en curso hasta terminar o agotar su timeout.
-- La inserción usa bloques de hasta 10 caracteres Unicode distintos, sin un límite global de 240. La respuesta está limitada a 2 MB y la transcripción a 100 000 bytes UTF-8. Respuestas truncadas o inválidas no se insertan.
-- No guarda audio ni texto. Un fallo de API o de inserción descarta el resultado; una interrupción durante la escritura puede dejar texto parcial, sin reintento para evitar duplicados.
+- La inserción directa en Wayland usa bloques de hasta 10 caracteres Unicode distintos, sin un límite global de 240. La respuesta está limitada a 2 MB y la transcripción a 100 000 bytes UTF-8. Respuestas truncadas o inválidas no se insertan.
+- La aplicación no guarda audio ni texto en archivos. Para toda redacción y para dictado en XWayland, copia el texto limpio con `wl-copy` y simula Ctrl+V. Algunas aplicaciones XWayland interpretan los keymaps Unicode dinámicos como números. **El resultado reemplaza el portapapeles y queda disponible allí; el gestor de historial puede conservarlo.** No se restaura el contenido anterior. Solo el dictado en Wayland mantiene la inserción directa sin tocar el portapapeles. No se accede al documento ni se lee su contenido.
+- Se comprueba el destino antes de copiar y de pegar; si cambia el foco, no se pega, aunque el portapapeles puede haber cambiado. Un fallo de copia no provoca un pegado ni un reintento con teclas numéricas. Suelta los modificadores físicos antes de insertar. Un fallo de API o de inserción descarta el resultado; una interrupción durante la escritura puede dejar texto parcial, sin reintento para evitar duplicados.
 - Con una URL base HTTP (incluido el valor predeterminado), clave y audio no están cifrados en tránsito: usa solo una red de confianza. Para cifrar el transporte, configura una URL HTTPS con un certificado válido; la validación TLS permanece activa y no se siguen redirecciones.
 - Usa un socket local con permisos 0600 en `$XDG_RUNTIME_DIR/hypr-dictate.sock`. Si el proceso termina abruptamente puede quedar un socket residual. Elimínalo manualmente únicamente después de comprobar que no queda otra instancia.
 - El dock usa un `memfd` y un pool de dos buffers. Solo reutiliza un buffer cuando el compositor lo libera; si ambos están ocupados, espera sin sobrescribirlos. GTK4 gestiona por separado el dibujo y los eventos de la ventana de ajustes; no se redibuja manualmente con cada frame del dock.
@@ -123,4 +130,6 @@ Prueba manual pendiente en la sesión gráfica:
 
 10. Configura modelos y atajos distintos para dictado y redacción y prueba ambos con el mismo mensaje. Comprueba que cada uno usa su modelo y prompt, que el modo del dock se aplica solo al guardar y que no se insertan saltos de línea como Enter. Elige una ruta `cuenta/modelo` distinta en un modo: no debe alterar el modelo del otro. Cierra sin guardar para comprobar que se descartan los cambios.
 
-Las pruebas automáticas verifican estados, ajustes, prioridades de autenticación, cabeceras HTTP con servidor local, separación de prompts, generación de ambos bindings y widgets GTK; no sustituyen estas comprobaciones de audio, calidad del modelo y teclado virtual.
+11. En un documento vacío de ONLYOFFICE (XWayland), prueba una nota con tildes, ñ, números y puntuación. Debe pegar texto, no secuencias de dígitos. El resultado debe quedar en el portapapeles. Pide en redacción una nota con fecha explícita, asunto, párrafos y una tabulación; debe mantener esa estructura sin Markdown. Repite en un editor Wayland: la redacción debe pegar también con párrafos y tabulaciones, mientras el dictado sigue usando inserción directa en una sola línea sin cambiar el portapapeles.
+
+Las pruebas automáticas verifican estados, ajustes, prioridades de autenticación, cabeceras HTTP con servidor local, separación de prompts, generación de ambos bindings, widgets GTK y las comprobaciones de foco/copia de la ruta XWayland; no sustituyen estas comprobaciones de audio, calidad del modelo y pegado real en la aplicación destino.

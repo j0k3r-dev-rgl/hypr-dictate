@@ -287,8 +287,8 @@ impl Preferences {
         row(
             &server,
             "network-server-symbolic",
-            "URL base de CLIProxyAPI",
-            "HTTP o HTTPS, sin /v1, credenciales, parámetros ni fragmentos.",
+            "URL base del servidor OpenAI-compatible",
+            "URL base exacta del proveedor: solo se añaden /models y /chat/completions. Incluye /v1 únicamente si tu proveedor lo requiere.",
             &url,
         );
         let api_key = gtk::PasswordEntry::builder()
@@ -581,10 +581,20 @@ impl Widgets {
     }
 }
 fn dropdown() -> gtk::DropDown {
-    gtk::DropDown::builder()
+    let field = gtk::DropDown::builder()
+        .expression(gtk::PropertyExpression::new(
+            gtk::StringObject::static_type(),
+            None::<gtk::Expression>,
+            "string",
+        ))
         .enable_search(true)
         .hexpand(true)
-        .build()
+        .build();
+    // GTK 4.12+ can match a model name anywhere in its account/model route.
+    if field.find_property("search-match-mode").is_some() {
+        field.set_property("search-match-mode", gtk::StringFilterMatchMode::Substring);
+    }
+    field
 }
 fn set_options(field: &gtk::DropDown, items: &[String], selected: u32) {
     let labels: Vec<_> = items.iter().map(String::as_str).collect();
@@ -630,6 +640,29 @@ mod tests {
         let preferences = Preferences::new(&saved, &models, &[], &[], "test", tx.clone()).unwrap();
         let w = &preferences.0;
         assert_eq!(w.model.selected(), 0);
+        for field in [&w.model, &w.model_formal] {
+            let expression = field.expression().expect("search needs a text expression");
+            let filter = gtk::StringFilter::new(Some(expression));
+            if field.find_property("search-match-mode").is_some() {
+                let mode = field.property::<gtk::StringFilterMatchMode>("search-match-mode");
+                assert_eq!(mode, gtk::StringFilterMatchMode::Substring);
+                filter.set_match_mode(mode);
+            }
+            filter.set_ignore_case(true);
+            filter.set_search(Some("AuDiO"));
+            let filtered = gtk::FilterListModel::new(field.model(), Some(filter));
+            assert_eq!(filtered.n_items(), 1);
+            assert_eq!(
+                filtered
+                    .item(0)
+                    .unwrap()
+                    .downcast::<gtk::StringObject>()
+                    .unwrap()
+                    .string(),
+                "account/audio"
+            );
+            assert_eq!(field.selected(), 0, "search must not select implicitly");
+        }
         let labels = w
             .model
             .model()

@@ -103,8 +103,140 @@ pub fn sanitize_plain_text(text: &str) -> String {
     out.trim_end().to_owned()
 }
 
+fn remove_inline_markdown(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let previous = out.chars().next_back();
+        let mut consumed = false;
+        for marker in ["**", "__", "~~", "*", "_", "`"] {
+            if previous.is_some_and(char::is_alphanumeric) {
+                continue;
+            }
+            if let Some(inner) = rest.strip_prefix(marker)
+                && let Some(end) = inner.find(marker)
+            {
+                let content = &inner[..end];
+                let after = &inner[end + marker.len()..];
+                if !content.is_empty()
+                    && !content.starts_with(char::is_whitespace)
+                    && !content.ends_with(char::is_whitespace)
+                    && !after.starts_with(char::is_alphanumeric)
+                {
+                    out.push_str(&remove_inline_markdown(content));
+                    rest = after;
+                    consumed = true;
+                    break;
+                }
+            }
+        }
+        if consumed {
+            continue;
+        }
+        if let Some(label) = rest.strip_prefix('[')
+            && let Some(end) = label.find("](")
+            && let Some(close) = label[end + 2..].find(')')
+        {
+            out.push_str(&label[..end]);
+            out.push_str(" (");
+            out.push_str(&label[end + 2..end + 2 + close]);
+            out.push(')');
+            rest = &label[end + 2 + close + 1..];
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+pub fn sanitize_redaction_text(text: &str) -> String {
+    let normalized: String = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+        .collect();
+    let mut lines = Vec::new();
+    for line in normalized.split('\n') {
+        let content = line.trim_start_matches([' ', '\t']);
+        let indentation = &line[..line.len() - content.len()];
+        if content.starts_with("```") || content.starts_with("~~~") {
+            continue;
+        }
+        let mut plain = content;
+        let hashes = plain.bytes().take_while(|ch| *ch == b'#').count();
+        if (1..=6).contains(&hashes) && plain[hashes..].starts_with(' ') {
+            plain = plain[hashes..].trim_start();
+        }
+        while let Some(quoted) = plain.strip_prefix("> ") {
+            plain = quoted;
+        }
+        for bullet in ["- ", "* ", "+ "] {
+            if let Some(item) = plain.strip_prefix(bullet) {
+                plain = item;
+                break;
+            }
+        }
+        lines.push(format!("{indentation}{}", remove_inline_markdown(plain)));
+    }
+    let start = lines.iter().position(|line| !line.trim().is_empty());
+    let end = lines.iter().rposition(|line| !line.trim().is_empty());
+    match (start, end) {
+        (Some(start), Some(end)) => lines[start..=end].join("\n"),
+        _ => String::new(),
+    }
+}
+
+pub fn insertion_uses_clipboard(mode: DictationMode, xwayland: bool) -> bool {
+    mode == DictationMode::Formal || xwayland
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redaction_preserves_paragraphs_tabs_indentation_and_legitimate_content() {
+        let input = "Fecha: 12/11/2026\r\n\r\n\tAsunto: Solicitud de recursos\r\n  Se solicitan 2 equipos.\n\nDice: \"servicio validado\"; 2 * 3 = 6; archivo_datos; #123.\0\u{1b}";
+        let expected = "Fecha: 12/11/2026\n\n\tAsunto: Solicitud de recursos\n  Se solicitan 2 equipos.\n\nDice: \"servicio validado\"; 2 * 3 = 6; archivo_datos; #123.";
+        assert_eq!(super::sanitize_redaction_text(input), expected);
+    }
+
+    #[test]
+    fn redaction_removes_markdown_presentation_without_flattening_the_document() {
+        let input = "```text\n# Solicitud\n\n**Asunto:** Recursos _informáticos_\n\t- Dos equipos\n> Servicio `validado`\n[Referencia](https://example.com)\n```";
+        let expected = "Solicitud\n\nAsunto: Recursos informáticos\n\tDos equipos\nServicio validado\nReferencia (https://example.com)";
+        assert_eq!(super::sanitize_redaction_text(input), expected);
+        assert_eq!(super::sanitize_redaction_text(" \n\t\r\n"), "");
+    }
+
+    #[test]
+    fn redaction_pastes_on_all_targets_while_dictation_only_pastes_on_xwayland() {
+        assert!(super::insertion_uses_clipboard(
+            super::DictationMode::Formal,
+            false
+        ));
+        assert!(super::insertion_uses_clipboard(
+            super::DictationMode::Formal,
+            true
+        ));
+        assert!(super::insertion_uses_clipboard(
+            super::DictationMode::Transcription,
+            true
+        ));
+        assert!(!super::insertion_uses_clipboard(
+            super::DictationMode::Transcription,
+            false
+        ));
+    }
+
+    #[test]
+    fn redaction_preserves_numbered_sections_urls_and_quoted_content() {
+        let text = "Informe\n\n1. Servicio validado\n\t2 equipos; 100 100\n\nReferencia: https://example.com\nDijo: «listo» y \"aprobado\".\nA_B, #123, 2 * 3.";
+        assert_eq!(super::sanitize_redaction_text(text), text);
+        assert_eq!(super::sanitize_plain_text("a\n\nb\tc"), "a b c");
+    }
+
     #[test]
     fn plain_text_sanitization_preserves_repeated_numbers() {
         for text in [
