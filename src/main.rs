@@ -76,8 +76,12 @@ impl App {
             return Ok(());
         }
         ensure!(
-            !self.settings.model.trim().is_empty(),
-            "Selecciona y guarda un modelo del catálogo antes de grabar"
+            !self.settings.model_for(mode).trim().is_empty(),
+            "Selecciona y guarda un modelo del catálogo para {} antes de grabar",
+            match mode {
+                DictationMode::Transcription => "dictado",
+                DictationMode::Formal => "redacción",
+            }
         );
         self.discard_capture();
         let address = active_address()?;
@@ -184,7 +188,7 @@ impl App {
         let client = self.client.clone();
         let key = self.settings.effective_key(&self.key);
         let endpoint = self.endpoint.clone();
-        let model = self.settings.model.clone();
+        let model = self.settings.model_for(self.mode).to_owned();
         let temperature = self.settings.temperature;
         let prompt = self.settings.prompt_for(self.mode).to_owned();
         thread::spawn(move || {
@@ -407,10 +411,7 @@ impl App {
                     !matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)),
                     "Espera a terminar el dictado"
                 );
-                ensure!(
-                    ui.models.contains(&settings.model),
-                    "Selecciona un modelo del catálogo"
-                );
+                settings.validate_models(&ui.models)?;
                 ensure!(
                     settings.microphone.is_empty()
                         || ui.microphones.iter().any(|m| m.name == settings.microphone),
@@ -766,6 +767,8 @@ mod tests {
             app.endpoint = endpoint;
             app.settings.api_key = Some("saved-key".into());
             app.key = "environment-key".into();
+            app.settings.model = "dictation/model".into();
+            app.settings.model_formal = "redaction/model".into();
             app.settings.prompt = "Transcribe fielmente".into();
             app.settings.prompt_formal = "Redacta profesionalmente".into();
             app.capture = Some(Capture {
@@ -781,6 +784,7 @@ mod tests {
             assert_eq!(id, 3);
             assert_eq!(result.unwrap(), ("0xabc".into(), "Texto final".into()));
             let body = server.join().unwrap();
+            assert_eq!(body["model"], app.settings.model_for(mode));
             assert_eq!(
                 body["messages"][0]["content"][0]["text"],
                 app.settings.prompt_for(mode)
@@ -789,6 +793,24 @@ mod tests {
                 body["messages"][0]["content"][1]["input_audio"]["format"],
                 "wav"
             );
+        }
+    }
+
+    #[test]
+    fn starting_a_mode_never_falls_back_to_the_other_modes_model() {
+        for mode in [DictationMode::Transcription, DictationMode::Formal] {
+            let mut app = app(Phase::Idle);
+            match mode {
+                DictationMode::Transcription => app.settings.model_formal = "other/model".into(),
+                DictationMode::Formal => app.settings.model = "other/model".into(),
+            }
+            let error = app.start_mode(false, mode).unwrap_err();
+            assert!(error.to_string().contains(match mode {
+                DictationMode::Transcription => "para dictado",
+                DictationMode::Formal => "para redacción",
+            }));
+            assert_eq!(app.phase, Phase::Idle);
+            assert!(app.capture.is_none());
         }
     }
 
@@ -909,9 +931,11 @@ mod tests {
         assert!(!app.catalog_is_current(&base, 4));
         assert!(app.catalog_is_current(&base, 5));
         let error = app
-            .save_server(settings::DEFAULT_BASE_URL, Some("bad\r\nkey".into()), |_| {
-                panic!("invalid key must not persist")
-            })
+            .save_server(
+                settings::DEFAULT_BASE_URL,
+                Some("bad\r\nkey".into()),
+                |_| panic!("invalid key must not persist"),
+            )
             .unwrap_err();
         assert!(!error.to_string().contains("bad"));
         assert_eq!(app.settings.effective_key(&app.key), "new");

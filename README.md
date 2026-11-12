@@ -16,7 +16,7 @@ El caparazón oscuro aparece muy bajo y pegado al borde inferior. Al grabar se e
 
 Los ajustes usan controles GTK4 nativos: desplegables con búsqueda, campo de URL y editor de prompt con selección, portapapeles, deshacer y scroll. Tab permite recorrer los controles; Shift+Tab vuelve atrás. Los iconos simbólicos vienen del tema del sistema y acompañan etiquetas y ayudas, sin una biblioteca adicional de iconos.
 
-En **General**, «Automática» muestra modelos sin prefijo. Son rutas del catálogo, no credenciales verificadas; no todos los modelos aceptan audio. No se selecciona un modelo automáticamente. Pulsa **Guardar cambios** para aplicar modelo, atajo, micrófono, pantalla y parámetros de IA. La pantalla del dock cambia al guardar, no como vista previa. Cerrar por el botón o por el gestor de ventanas descarta los cambios sin guardar. Los ajustes, incluida la API key si decides guardarla, se guardan en `~/.config/hypr-dictate/settings.json` con permisos 0600 (solo tu usuario). La clave queda en texto plano, no en un almacén cifrado; no compartas ese archivo.
+En **General**, cada selector muestra las rutas completas del catálogo (por ejemplo, `cuenta/modelo`) y también modelos sin prefijo. No son credenciales verificadas; no todos los modelos aceptan audio. No se selecciona un modelo automáticamente. Pulsa **Guardar cambios** para aplicar modelo, atajo, micrófono, pantalla y parámetros de IA. La pantalla del dock cambia al guardar, no como vista previa. Cerrar por el botón o por el gestor de ventanas descarta los cambios sin guardar. Los ajustes, incluida la API key si decides guardarla, se guardan en `~/.config/hypr-dictate/settings.json` con permisos 0600 (solo tu usuario). La clave queda en texto plano, no en un almacén cifrado; no compartas ese archivo.
 
 ### Ajustes flotantes en Hyprland
 
@@ -52,12 +52,16 @@ Se añaden `/v1/chat/completions` para transcribir y `/v1/models?client_version=
 
 Los ajustes anteriores sin `base_url` usan localhost. Una URL ya guardada se conserva. No se puede cambiar el servidor mientras se graba o procesa un dictado.
 
-Si no hay un modelo guardado, abre los ajustes, selecciona uno del catálogo que acepte audio y pulsa **Guardar cambios** antes de grabar. No se elige automáticamente una ruta ni una cuenta. Los modelos ya guardados se conservan.
+En **General** hay un único desplegable con búsqueda por función: **Modelo de dictado** y **Modelo de redacción profesional**. Cada uno muestra el catálogo completo con la ruta `cuenta/modelo`, sin selector de cuenta ni filtros por cuenta. Puedes elegir rutas distintas, siempre del mismo servidor y con la misma API key. Ambos modelos deben admitir entrada de audio.
+
+Elige explícitamente un modelo del catálogo para cada modo que quieras usar y pulsa **Guardar cambios**. Puedes dejar uno sin configurar; ese modo pedirá elegir y guardar su modelo antes de grabar, sin utilizar el del otro. No se elige automáticamente una ruta ni una cuenta. El modelo guardado anteriormente se conserva como modelo de dictado; redacción queda sin modelo hasta que elijas uno. Cambiar el modelo de un modo no altera la selección del otro. Cerrar sin guardar descarta ambas selecciones pendientes.
 
 ## Dictado y redacción profesional
 
 - **Dictado** mantiene el comportamiento y el prompt de transcripción actuales.
-- **Redacción profesional** convierte lo que dictas en un mensaje más claro, natural y profesional, sin inventar datos, saludos ni despedidas. No lee la ventana activa, otros textos ni el portapapeles: solo utiliza tu audio y el prompt de ese modo.
+- **Redacción profesional** interpreta tu encargo hablado y escribe el texto que pides, en lugar de transcribir tus instrucciones. Por ejemplo, «haz un mensaje para Discord anunciando la prueba de hoy a las ocho, cercano y corto» debe producir el anuncio listo para pegar, sin incluir «haz un mensaje para Discord». Adapta canal, destinatario, tono y extensión; puede reorganizar y reformular las ideas, pero no inventar hechos. No publica ni envía nada, ni lee otros textos o el portapapeles: solo utiliza tu audio y el prompt de ese modo.
+
+Los prompts ya guardados no se sustituyen automáticamente al actualizar. Para usar el nuevo comportamiento de redacción, pega el prompt nuevo en su editor y guarda; **Restaurar valores** restaura ambos prompts y también la temperatura. Comprueba con audio real el modelo elegido: las pruebas locales verifican el prompt enviado, no la calidad de la respuesta del modelo.
 
 En **General**, activa **Redacción profesional al usar el dock** para usar ese modo con el botón del dock o `toggle`. También puedes configurar un **Atajo de redacción profesional** independiente del atajo de dictado; ambos empiezan desactivados en ajustes nuevos. Cada atajo mantiene su modo durante toda la grabación. En **Prompts e IA** puedes editar ambos prompts por separado; **Restaurar valores** los restaura en el borrador. Pulsa **Guardar cambios** para aplicar estas opciones.
 
@@ -117,6 +121,6 @@ Prueba manual pendiente en la sesión gráfica:
 8. Abre y cierra los ajustes varias veces mientras grabas o procesas: el dock debe seguir animándose, sin parpadeos ni bloqueos. En el prompt, prueba flechas, selección, Ctrl+A, copiar/pegar, deshacer, rueda y barra de scroll. Comprueba también la edición de la URL y el foco con Tab.
 9. Cambia la pantalla del dock y cierra sin guardar: no debe moverse. Repite y guarda: debe moverse a la pantalla elegida. Comprueba que los iconos se muestran, que la ventana se puede redimensionar y que cerrar desde Hyprland descarta el borrador.
 
-10. Configura dos atajos distintos y prueba dictado y redacción con el mismo mensaje. Comprueba que cada uno usa su prompt, que el modo del dock se aplica solo al guardar y que no se insertan saltos de línea como Enter.
+10. Configura modelos y atajos distintos para dictado y redacción y prueba ambos con el mismo mensaje. Comprueba que cada uno usa su modelo y prompt, que el modo del dock se aplica solo al guardar y que no se insertan saltos de línea como Enter. Elige una ruta `cuenta/modelo` distinta en un modo: no debe alterar el modelo del otro. Cierra sin guardar para comprobar que se descartan los cambios.
 
 Las pruebas automáticas verifican estados, ajustes, prioridades de autenticación, cabeceras HTTP con servidor local, separación de prompts, generación de ambos bindings y widgets GTK; no sustituyen estas comprobaciones de audio, calidad del modelo y teclado virtual.

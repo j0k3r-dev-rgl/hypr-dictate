@@ -4,6 +4,7 @@ use crate::{
 };
 use anyhow::Result;
 use gtk4::{self as gtk, prelude::*};
+use hypr_dictate::DictationMode;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -23,45 +24,20 @@ const SHORTCUTS: [&str; 6] = [
 struct Draft {
     settings: Settings,
     models: Vec<String>,
-    account: String,
 }
 impl Draft {
     fn new(settings: &Settings, models: &[String]) -> Self {
         Self {
             settings: settings.clone(),
             models: models.to_vec(),
-            account: account_of(&settings.model).into(),
         }
     }
-    fn accounts(&self) -> Vec<String> {
-        let mut accounts = vec![String::new()];
-        for model in &self.models {
-            let account = account_of(model).to_owned();
-            if !accounts.contains(&account) {
-                accounts.push(account);
+    fn choose_model(&mut self, model: &str, mode: DictationMode) {
+        if model.is_empty() || self.models.iter().any(|item| item == model) {
+            match mode {
+                DictationMode::Transcription => self.settings.model = model.into(),
+                DictationMode::Formal => self.settings.model_formal = model.into(),
             }
-        }
-        if !accounts.contains(&self.account) {
-            accounts.push(self.account.clone());
-        }
-        accounts
-    }
-    fn available(&self) -> Vec<String> {
-        self.models
-            .iter()
-            .filter(|model| account_of(model) == self.account)
-            .cloned()
-            .collect()
-    }
-    fn choose_account(&mut self, account: String) {
-        if self.account != account {
-            self.account = account;
-            self.settings.model.clear();
-        }
-    }
-    fn choose_model(&mut self, model: &str) {
-        if self.available().iter().any(|item| item == model) {
-            self.settings.model = model.into();
         }
     }
     fn server_saved(&mut self, url: &str, api_key: Option<&str>) {
@@ -69,9 +45,6 @@ impl Draft {
         self.settings.api_key = api_key.map(str::to_owned);
         self.models.clear();
     }
-}
-fn account_of(model: &str) -> &str {
-    model.split_once('/').map_or("", |(account, _)| account)
 }
 fn selected(items: &[String], value: &str) -> u32 {
     items
@@ -82,8 +55,8 @@ fn selected(items: &[String], value: &str) -> u32 {
 
 struct Widgets {
     window: gtk::ApplicationWindow,
-    account: gtk::DropDown,
     model: gtk::DropDown,
+    model_formal: gtk::DropDown,
     shortcut: gtk::DropDown,
     shortcut_formal: gtk::DropDown,
     formal: gtk::CheckButton,
@@ -162,8 +135,8 @@ impl Preferences {
         root.append(&stack);
 
         let general = page();
-        let account = dropdown();
         let model = dropdown();
+        let model_formal = dropdown();
         let shortcut = gtk::DropDown::from_strings(&[
             "Sin atajo",
             SHORTCUTS[1],
@@ -181,22 +154,22 @@ impl Preferences {
             SHORTCUTS[5],
         ]);
         let formal = gtk::CheckButton::with_label("Redacción profesional al usar el dock");
-        formal.set_tooltip_text(Some("Reformula tu dictado con claridad y tono profesional, sin inventar datos ni leer otras aplicaciones."));
+        formal.set_tooltip_text(Some("Interpreta tu encargo hablado y escribe el texto solicitado para su canal, destinatario y tono, sin inventar datos ni leer otras aplicaciones."));
         let microphone = dropdown();
         let monitor = dropdown();
         row(
             &general,
-            "avatar-default-symbolic",
-            "Cuenta / ruta",
-            "Automática muestra los modelos sin prefijo.",
-            &account,
+            "applications-science-symbolic",
+            "Modelo de dictado",
+            "Elige la ruta completa cuenta/modelo del catálogo; debe aceptar audio.",
+            &model,
         );
         row(
             &general,
             "applications-science-symbolic",
-            "Modelo",
-            "Selecciona explícitamente un modelo que acepte audio.",
-            &model,
+            "Modelo de redacción profesional",
+            "Elige la ruta completa cuenta/modelo; no cambia el modelo de dictado y debe aceptar audio.",
+            &model_formal,
         );
         row(
             &general,
@@ -394,8 +367,8 @@ impl Preferences {
 
         let widgets = Rc::new(Widgets {
             window,
-            account,
             model,
+            model_formal,
             shortcut,
             shortcut_formal,
             formal,
@@ -416,35 +389,25 @@ impl Preferences {
         });
         widgets.load();
         widgets.status.set_text(message);
-        let weak = Rc::downgrade(&widgets);
-        widgets.account.connect_selected_notify(move |field| {
-            if let Some(w) = weak.upgrade()
-                && !w.updating.get()
-            {
-                let accounts = w.data.borrow().accounts();
-                if let Some(account) = accounts.get(field.selected() as usize) {
-                    w.data.borrow_mut().choose_account(account.clone());
-                    w.rebuild_models();
-                }
-            }
-        });
-        let weak = Rc::downgrade(&widgets);
-        widgets.model.connect_selected_notify(move |field| {
-            if let Some(w) = weak.upgrade()
-                && !w.updating.get()
-            {
-                let models = w.data.borrow().available();
-                if let Some(model) = field
-                    .selected()
-                    .checked_sub(1)
-                    .and_then(|i| models.get(i as usize))
+        for (model_field, mode) in [
+            (&widgets.model, DictationMode::Transcription),
+            (&widgets.model_formal, DictationMode::Formal),
+        ] {
+            let weak = Rc::downgrade(&widgets);
+            model_field.connect_selected_notify(move |field| {
+                if let Some(w) = weak.upgrade()
+                    && !w.updating.get()
                 {
-                    w.data.borrow_mut().choose_model(model);
-                } else {
-                    w.data.borrow_mut().settings.model.clear();
+                    let models = w.data.borrow().models.clone();
+                    let model = field
+                        .selected()
+                        .checked_sub(1)
+                        .and_then(|i| models.get(i as usize))
+                        .map_or("", String::as_str);
+                    w.data.borrow_mut().choose_model(model, mode);
                 }
-            }
-        });
+            });
+        }
         let weak = Rc::downgrade(&widgets);
         save.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
@@ -499,14 +462,14 @@ impl Preferences {
     }
     pub fn catalog_loaded(&self, models: &[String]) {
         self.0.data.borrow_mut().models = models.to_vec();
-        self.0.rebuild_accounts();
+        self.0.rebuild_models();
     }
     pub fn server_saved(&self, base_url: &str, api_key: Option<&str>) {
         self.0.data.borrow_mut().server_saved(base_url, api_key);
         self.0.url.set_text(base_url);
         self.0.api_key.set_text(api_key.unwrap_or(""));
         self.0.use_environment.set_active(api_key.is_none());
-        self.0.rebuild_accounts();
+        self.0.rebuild_models();
     }
     pub fn position_saved(&self, x: i32) {
         self.0.data.borrow_mut().settings.x = x;
@@ -562,38 +525,24 @@ impl Widgets {
             selected(&monitors, &data.settings.monitor),
         );
         drop(data);
-        self.rebuild_accounts();
-    }
-    fn rebuild_accounts(&self) {
-        self.updating.set(true);
-        let data = self.data.borrow();
-        let accounts = data.accounts();
-        let labels: Vec<_> = accounts
-            .iter()
-            .map(|a| {
-                if a.is_empty() {
-                    "Automática".into()
-                } else {
-                    a.clone()
-                }
-            })
-            .collect();
-        set_options(&self.account, &labels, selected(&accounts, &data.account));
-        drop(data);
-        self.updating.set(false);
         self.rebuild_models();
     }
     fn rebuild_models(&self) {
         self.updating.set(true);
         let data = self.data.borrow();
-        let models = data.available();
-        let index = models
-            .iter()
-            .position(|model| model == &data.settings.model)
-            .map_or(0, |i| i as u32 + 1);
-        let mut labels = vec!["Selecciona un modelo…".to_owned()];
-        labels.extend(models);
-        set_options(&self.model, &labels, index);
+        for (field, mode) in [
+            (&self.model, DictationMode::Transcription),
+            (&self.model_formal, DictationMode::Formal),
+        ] {
+            let models = &data.models;
+            let index = models
+                .iter()
+                .position(|model| model == data.settings.model_for(mode))
+                .map_or(0, |i| i as u32 + 1);
+            let mut labels = vec!["Selecciona un modelo…".to_owned()];
+            labels.extend(models.iter().cloned());
+            set_options(field, &labels, index);
+        }
         self.updating.set(false);
     }
     fn snapshot(&self) -> Settings {
@@ -681,9 +630,27 @@ mod tests {
         let preferences = Preferences::new(&saved, &models, &[], &[], "test", tx.clone()).unwrap();
         let w = &preferences.0;
         assert_eq!(w.model.selected(), 0);
-        w.account.set_selected(1);
-        assert_eq!(w.model.selected(), 0);
-        w.model.set_selected(1);
+        let labels = w
+            .model
+            .model()
+            .unwrap()
+            .downcast::<gtk::StringList>()
+            .unwrap();
+        assert_eq!(labels.n_items(), 3);
+        assert_eq!(labels.string(1).unwrap(), "plain");
+        assert_eq!(labels.string(2).unwrap(), "account/audio");
+        w.model.set_selected(2);
+        assert_eq!(w.model_formal.selected(), 0);
+        w.model_formal.set_selected(1);
+        assert_eq!(w.snapshot().model_formal, "plain");
+        assert_eq!(w.snapshot().model, "account/audio");
+        w.model_formal.set_selected(2);
+        assert_eq!(w.snapshot().model_formal, "account/audio");
+        assert_eq!(w.snapshot().model, "account/audio");
+        w.model_formal.set_selected(0);
+        assert!(w.snapshot().model_formal.is_empty());
+        w.model_formal.set_selected(1);
+        assert_eq!(w.snapshot().model_formal, "plain");
         assert!(w.api_key.shows_peek_icon());
         assert!(w.use_environment.is_active());
         assert!(!w.api_key.is_sensitive());
@@ -702,6 +669,7 @@ mod tests {
         w.url.set_text("https://new.example");
         let snapshot = w.snapshot();
         assert_eq!(snapshot.model, "account/audio");
+        assert_eq!(snapshot.model_formal, "plain");
         assert_eq!(snapshot.prompt, "áñ🙂\nsecond line");
         assert_eq!(snapshot.base_url, settings::DEFAULT_BASE_URL);
         assert!(
@@ -733,7 +701,7 @@ mod tests {
         }
         assert!(click(w.window.upcast_ref(), "Guardar cambios"));
         assert!(
-            matches!(rx.try_recv().unwrap(), Event::Save(settings) if settings.prompt == snapshot.prompt && settings.base_url == settings::DEFAULT_BASE_URL)
+            matches!(rx.try_recv().unwrap(), Event::Save(settings) if settings.prompt == snapshot.prompt && settings.base_url == settings::DEFAULT_BASE_URL && settings.model_formal == "plain" && settings.model == "account/audio")
         );
         assert!(click(w.window.upcast_ref(), "Guardar servidor y API key"));
         assert!(
@@ -741,12 +709,16 @@ mod tests {
         );
         preferences.server_saved("https://new.example", Some("draft-secret"));
         assert_eq!(w.snapshot().api_key.as_deref(), Some("draft-secret"));
+        assert_eq!(w.snapshot().model, "account/audio");
+        assert_eq!(w.snapshot().model_formal, "plain");
         assert!(w.snapshot().formal);
         assert_eq!(w.snapshot().prompt_formal, "Redacta este mensaje.");
         assert_eq!(w.snapshot().prompt, snapshot.prompt);
         assert_eq!(w.snapshot().base_url, "https://new.example");
         preferences.catalog_loaded(&models);
-        assert_eq!(w.model.selected(), 1);
+        assert_eq!(w.model.selected(), 2);
+        assert_eq!(w.model_formal.selected(), 1);
+        assert_eq!(w.snapshot().model_formal, "plain");
         let theme = gtk::IconTheme::for_display(&gtk::gdk::Display::default().unwrap());
         for icon in [
             "document-save-symbolic",
@@ -754,7 +726,6 @@ mod tests {
             "window-close-symbolic",
             "audio-input-microphone-symbolic",
             "network-server-symbolic",
-            "avatar-default-symbolic",
             "applications-science-symbolic",
             "input-keyboard-symbolic",
             "video-display-symbolic",
@@ -770,6 +741,8 @@ mod tests {
         let reopened = Preferences::new(&saved, &models, &[], &[], "test", tx).unwrap();
         assert_eq!(reopened.0.snapshot().prompt, saved.prompt);
         assert!(!reopened.0.snapshot().formal);
+        assert!(reopened.0.snapshot().model_formal.is_empty());
+        assert_eq!(reopened.0.model_formal.selected(), 0);
         assert_eq!(reopened.0.snapshot().prompt_formal, saved.prompt_formal);
         assert!(reopened.0.api_key.text().is_empty());
         assert!(reopened.0.use_environment.is_active());
@@ -777,19 +750,38 @@ mod tests {
     }
 
     #[test]
-    fn catalog_never_selects_a_model_implicitly_and_account_changes_clear_selection() {
+    fn complete_model_routes_can_be_selected_without_an_account_filter() {
+        let saved = Settings::default();
+        let mut draft = Draft::new(&saved, &["account/audio".into(), "other/redaction".into()]);
+        draft.choose_model("account/audio", DictationMode::Transcription);
+        draft.choose_model("other/redaction", DictationMode::Formal);
+        assert_eq!(draft.settings.model, "account/audio");
+        assert_eq!(draft.settings.model_formal, "other/redaction");
+        draft.choose_model("other/redaction", DictationMode::Transcription);
+        assert_eq!(draft.settings.model, "other/redaction");
+        assert_eq!(draft.settings.model_formal, "other/redaction");
+        draft.choose_model("", DictationMode::Formal);
+        assert!(draft.settings.model_formal.is_empty());
+        assert_eq!(draft.settings.model, "other/redaction");
+        draft.choose_model("unknown/model", DictationMode::Transcription);
+        assert_eq!(draft.settings.model, "other/redaction");
+    }
+
+    #[test]
+    fn catalog_never_selects_a_model_implicitly_and_modes_are_independent() {
         let saved = Settings::default();
         let mut draft = Draft::new(&saved, &["plain".into(), "account/audio".into()]);
         assert!(draft.settings.model.is_empty());
         assert_eq!(
-            selected(&draft.available(), &draft.settings.model),
+            selected(&draft.models, &draft.settings.model),
             gtk::INVALID_LIST_POSITION
         );
-        draft.choose_account("account".into());
-        assert!(draft.settings.model.is_empty());
-        draft.choose_model("account/audio");
+        assert!(draft.settings.model_formal.is_empty());
+        draft.choose_model("account/audio", DictationMode::Transcription);
         assert_eq!(draft.settings.model, "account/audio");
-        draft.choose_account(String::new());
+        draft.choose_model("plain", DictationMode::Formal);
+        assert_eq!(draft.settings.model_formal, "plain");
+        draft.choose_model("", DictationMode::Transcription);
         assert!(draft.settings.model.is_empty());
         assert!(saved.model.is_empty());
     }
@@ -797,14 +789,17 @@ mod tests {
     fn saved_model_is_preserved_and_server_save_does_not_commit_other_drafts() {
         let saved = Settings {
             model: "account/audio".into(),
+            model_formal: "other/redaction".into(),
             ..Settings::default()
         };
-        let mut draft = Draft::new(&saved, &["account/audio".into()]);
-        assert_eq!(selected(&draft.available(), &draft.settings.model), 0);
+        let mut draft = Draft::new(&saved, &["account/audio".into(), "other/redaction".into()]);
+        assert_eq!(selected(&draft.models, &draft.settings.model_formal), 1);
+        assert_eq!(selected(&draft.models, &draft.settings.model), 0);
         draft.settings.prompt = "pending".into();
         draft.server_saved("https://new.example", None);
         assert_eq!(draft.settings.prompt, "pending");
         assert_eq!(draft.settings.model, "account/audio");
+        assert_eq!(draft.settings.model_formal, "other/redaction");
         assert!(draft.models.is_empty());
         assert_ne!(saved.prompt, draft.settings.prompt);
         assert_eq!(saved.base_url, settings::DEFAULT_BASE_URL);
