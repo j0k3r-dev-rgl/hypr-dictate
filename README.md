@@ -8,7 +8,7 @@ Requiere Rust, `pkg-config` y las bibliotecas de desarrollo de GTK4 para compila
 
 ```bash
 cargo build --release
-# CLIPROXYAPI_API_KEY debe estar ya exportada en esta terminal.
+# La API key se puede introducir después desde los ajustes.
 ./target/release/hypr-dictate run
 ```
 
@@ -16,7 +16,7 @@ El caparazón oscuro aparece muy bajo y pegado al borde inferior. Al grabar se e
 
 Los ajustes usan controles GTK4 nativos: desplegables con búsqueda, campo de URL y editor de prompt con selección, portapapeles, deshacer y scroll. Tab permite recorrer los controles; Shift+Tab vuelve atrás. Los iconos simbólicos vienen del tema del sistema y acompañan etiquetas y ayudas, sin una biblioteca adicional de iconos.
 
-En **General**, «Automática» muestra modelos sin prefijo. Son rutas del catálogo, no credenciales verificadas; no todos los modelos aceptan audio. No se selecciona un modelo automáticamente. Pulsa **Guardar cambios** para aplicar modelo, atajo, micrófono, pantalla y parámetros de IA. La pantalla del dock cambia al guardar, no como vista previa. Cerrar por el botón o por el gestor de ventanas descarta los cambios sin guardar. Las preferencias sin secretos se guardan en `~/.config/hypr-dictate/settings.json`.
+En **General**, «Automática» muestra modelos sin prefijo. Son rutas del catálogo, no credenciales verificadas; no todos los modelos aceptan audio. No se selecciona un modelo automáticamente. Pulsa **Guardar cambios** para aplicar modelo, atajo, micrófono, pantalla y parámetros de IA. La pantalla del dock cambia al guardar, no como vista previa. Cerrar por el botón o por el gestor de ventanas descarta los cambios sin guardar. Los ajustes, incluida la API key si decides guardarla, se guardan en `~/.config/hypr-dictate/settings.json` con permisos 0600 (solo tu usuario). La clave queda en texto plano, no en un almacén cifrado; no compartas ese archivo.
 
 ### Ajustes flotantes en Hyprland
 
@@ -39,11 +39,14 @@ Ejecuta `hyprctl reload` y cierra y vuelve a abrir los ajustes para aplicar la r
 
 ### Servidor y modelo
 
-La clave se lee de `CLIPROXYAPI_API_KEY`, nunca de un archivo de configuración. La URL se configura desde la interfaz:
+La aplicación puede arrancar sin exportar ninguna clave. Configura servidor y autenticación desde la interfaz:
 
-1. Abre los ajustes con clic derecho y entra en **Servidor**.
+1. Abre los ajustes con clic derecho y entra en **Servidor y API key**.
 2. Edita la URL base de CLIProxyAPI; por defecto es **`http://127.0.0.1:8317`**.
-3. Pulsa **Guardar servidor**. Se guarda en `settings.json` y se recarga el catálogo sin reiniciar, aunque el servidor anterior esté caído. No aplica otros cambios pendientes de la ventana. Cerrar sin guardar descarta la edición.
+3. Desmarca **Usar CLIPROXYAPI_API_KEY** e introduce la clave. El campo la oculta y permite verla con el icono del ojo. Si el servidor no requiere autenticación, déjala vacía.
+4. Pulsa **Guardar servidor y API key**. Se guardan en `settings.json` y se recarga el catálogo sin reiniciar, aunque el servidor anterior esté caído. No aplica otros cambios pendientes de la ventana. Cerrar sin guardar descarta la edición.
+
+Si mantienes marcada **Usar CLIPROXYAPI_API_KEY**, se usa la variable heredada al arrancar (si existe) y no se copia su valor al archivo. Una clave manual, incluso vacía, tiene prioridad sobre la variable. La misma clave se usa para el catálogo y las transcripciones; guardar cambios generales no aplica una clave pendiente de guardar.
 
 Se añaden `/v1/chat/completions` para transcribir y `/v1/models?client_version=1` para el catálogo. La base admite HTTP o HTTPS, una barra final opcional y un prefijo de ruta (por ejemplo, `https://proxy.example.com/cliproxy`); no incluyas `/v1`, credenciales, parámetros ni fragmentos. Una URL vacía o inválida no se guarda. No se usa una variable de entorno para la dirección.
 
@@ -51,21 +54,31 @@ Los ajustes anteriores sin `base_url` usan localhost. Una URL ya guardada se con
 
 Si no hay un modelo guardado, abre los ajustes, selecciona uno del catálogo que acepte audio y pulsa **Guardar cambios** antes de grabar. No se elige automáticamente una ruta ni una cuenta. Los modelos ya guardados se conservan.
 
-## Atajo de mantener para hablar
+## Dictado y redacción profesional
+
+- **Dictado** mantiene el comportamiento y el prompt de transcripción actuales.
+- **Redacción profesional** convierte lo que dictas en un mensaje más claro, natural y profesional, sin inventar datos, saludos ni despedidas. No lee la ventana activa, otros textos ni el portapapeles: solo utiliza tu audio y el prompt de ese modo.
+
+En **General**, activa **Redacción profesional al usar el dock** para usar ese modo con el botón del dock o `toggle`. También puedes configurar un **Atajo de redacción profesional** independiente del atajo de dictado; ambos empiezan desactivados en ajustes nuevos. Cada atajo mantiene su modo durante toda la grabación. En **Prompts e IA** puedes editar ambos prompts por separado; **Restaurar valores** los restaura en el borrador. Pulsa **Guardar cambios** para aplicar estas opciones.
+
+La inserción de ambos modos sigue siendo texto plano en una sola línea: los saltos de línea se convierten en espacios por seguridad, nunca en pulsaciones de Enter.
+
+## Atajos de mantener para hablar
 
 Con el proceso principal ejecutándose:
 
 ```bash
-./target/release/hypr-dictate start
+./target/release/hypr-dictate start         # Dictado
+./target/release/hypr-dictate start-formal  # Redacción profesional
 ./target/release/hypr-dictate stop
-# Alternativa: toggle
+# Alternativa: toggle usa el modo elegido para el dock.
 ```
 
-El panel permite elegir entre combinaciones predefinidas (CTRL+SHIFT+D, CTRL+ALT+D, SUPER+SHIFT+D, SUPER+F9, SUPER+F10) o desactivar el atajo. No es todavía un capturador de cualquier combinación de teclado.
+El panel permite elegir, para cada modo, entre combinaciones predefinidas (CTRL+SHIFT+D, CTRL+ALT+D, SUPER+SHIFT+D, SUPER+F9, SUPER+F10) o desactivar el atajo. Los dos modos deben tener atajos distintos. No es todavía un capturador de cualquier combinación de teclado.
 
 Al guardar un cambio de atajo, comprueba conflictos en los bindings activos y modifica únicamente el bloque `-- BEGIN hypr-dictate` / `-- END hypr-dictate` de `~/.config/hypr/keybinds.lua`. Valida sintaxis con `luac -p`, recarga Hyprland y restaura el archivo si detecta errores de configuración. Requiere que ese archivo siga siendo el módulo cargado por tu configuración Lua. SUPER+D ya está ocupado en esta instalación y no se usa como valor predeterminado.
 
-Suelta la tecla principal antes que los modificadores para que coincida el binding de liberación. No instala arranque automático; el proceso principal debe seguir activo y heredar la clave. Una recarga externa puede afectar los bindings como cualquier otra configuración de Hyprland.
+Suelta la tecla principal antes que los modificadores para que coincida el binding de liberación. No instala arranque automático; el proceso principal debe seguir activo y, si eliges autenticación por variable de entorno, heredar la clave. Una recarga externa puede afectar los bindings como cualquier otra configuración de Hyprland.
 
 ## Comportamiento y límites
 
@@ -99,9 +112,11 @@ Prueba manual pendiente en la sesión gráfica:
 3. Cambia a otra ventana mientras procesa: debe volver al editor e insertar allí.
 4. Comprueba el atajo de pulsar/soltar y que no roba el foco al empezar.
 5. Cierra la ventana original durante otra petición: debe mostrar error y no escribir en la ventana alternativa.
-6. En **Servidor**, edita y guarda una URL válida: debe recargar el catálogo sin reiniciar. Cierra y abre los ajustes para comprobar que se conserva. Edita otra URL y cierra sin guardar: debe conservar la anterior.
-7. Con el servidor inaccesible, vuelve a **Servidor** y corrige la URL. El guardado no debe depender del catálogo anterior; una URL inválida debe mostrar un error sin aplicarse.
+6. En **Servidor y API key**, edita y guarda una URL y una clave válidas: debe recargar el catálogo sin reiniciar. Cierra y abre los ajustes para comprobar que se conservan. Edita otra URL o clave y cierra sin guardar: debe conservar las anteriores.
+7. Con el servidor inaccesible, vuelve a **Servidor y API key** y corrige la URL o la clave. El guardado no debe depender del catálogo anterior; una URL inválida debe mostrar un error sin aplicarse.
 8. Abre y cierra los ajustes varias veces mientras grabas o procesas: el dock debe seguir animándose, sin parpadeos ni bloqueos. En el prompt, prueba flechas, selección, Ctrl+A, copiar/pegar, deshacer, rueda y barra de scroll. Comprueba también la edición de la URL y el foco con Tab.
 9. Cambia la pantalla del dock y cierra sin guardar: no debe moverse. Repite y guarda: debe moverse a la pantalla elegida. Comprueba que los iconos se muestran, que la ventana se puede redimensionar y que cerrar desde Hyprland descarta el borrador.
 
-Las pruebas automáticas verifican estados, validación del destino y cabecera WAV; no sustituyen estas comprobaciones de audio, API y teclado virtual.
+10. Configura dos atajos distintos y prueba dictado y redacción con el mismo mensaje. Comprueba que cada uno usa su prompt, que el modo del dock se aplica solo al guardar y que no se insertan saltos de línea como Enter.
+
+Las pruebas automáticas verifican estados, ajustes, prioridades de autenticación, cabeceras HTTP con servidor local, separación de prompts, generación de ambos bindings y widgets GTK; no sustituyen estas comprobaciones de audio, calidad del modelo y teclado virtual.

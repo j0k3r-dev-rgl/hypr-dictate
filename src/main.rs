@@ -6,7 +6,7 @@ mod ui;
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
-use hypr_dictate::{Phase, valid_address, wav};
+use hypr_dictate::{DictationMode, Phase, valid_address, wav};
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
@@ -27,7 +27,7 @@ pub enum Event {
     Catalog(String, u64, Result<Vec<String>>),
     Save(settings::Settings),
     SavePosition(i32),
-    SaveServer(String),
+    SaveServer(String, Option<String>),
 }
 struct Capture {
     child: Child,
@@ -36,6 +36,7 @@ struct Capture {
 }
 pub struct App {
     phase: Phase,
+    mode: DictationMode,
     capture: Option<Capture>,
     last_request_id: u64,
     catalog_generation: u64,
@@ -65,6 +66,9 @@ impl App {
         }
     }
     fn start(&mut self, from_shortcut: bool) -> Result<()> {
+        self.start_mode(from_shortcut, self.settings.mode())
+    }
+    fn start_mode(&mut self, from_shortcut: bool, mode: DictationMode) -> Result<()> {
         if !matches!(self.phase, Phase::Idle | Phase::Error) {
             return Ok(());
         }
@@ -125,7 +129,11 @@ impl App {
             Ok(bytes)
         });
         if from_shortcut {
-            let shortcut = self.settings.shortcut.clone();
+            let shortcut = match mode {
+                DictationMode::Transcription => &self.settings.shortcut,
+                DictationMode::Formal => &self.settings.shortcut_formal,
+            }
+            .clone();
             let tx = self.tx.clone();
             thread::spawn(move || {
                 for tick in 0..20000 {
@@ -145,6 +153,7 @@ impl App {
             });
         }
         self.phase.start(&address);
+        self.mode = mode;
         self.capture = Some(Capture {
             child,
             reader,
@@ -170,11 +179,11 @@ impl App {
         }
         let tx = self.tx.clone();
         let client = self.client.clone();
-        let key = self.key.clone();
+        let key = self.settings.effective_key(&self.key);
         let endpoint = self.endpoint.clone();
         let model = self.settings.model.clone();
         let temperature = self.settings.temperature;
-        let prompt = self.settings.prompt.clone();
+        let prompt = self.settings.prompt_for(self.mode).to_owned();
         thread::spawn(move || {
             let result = (|| -> Result<(String, String)> {
                 let status = capture.child.wait()?;
@@ -242,6 +251,7 @@ impl App {
     fn save_server(
         &mut self,
         base_url: &str,
+        api_key: Option<String>,
         persist: impl FnOnce(&settings::Settings) -> Result<()>,
     ) -> Result<()> {
         ensure!(
@@ -251,6 +261,16 @@ impl App {
         let (endpoint, _) = api_endpoints(Some(base_url))?;
         let mut settings = self.settings.clone();
         settings.base_url = base_url.into();
+        settings.api_key = api_key.map(|key| key.trim().to_owned());
+        ensure!(
+            !settings
+                .api_key
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .any(char::is_control),
+            "La clave API contiene caracteres no válidos"
+        );
         persist(&settings)?;
         self.settings = settings;
         self.endpoint = endpoint;
@@ -261,7 +281,7 @@ impl App {
         let generation = self.catalog_generation;
         let base_url = self.settings.base_url.clone();
         let client = self.client.clone();
-        let key = self.key.clone();
+        let key = self.settings.effective_key(&self.key);
         let tx = self.tx.clone();
         thread::spawn(move || {
             let result = api_endpoints(Some(&base_url))
@@ -323,7 +343,7 @@ impl App {
                     ui.dirty = true;
                     Ok(())
                 }
-                "start" => {
+                "start" | "start-formal" => {
                     if matches!(self.phase, Phase::Processing(_)) {
                         self.phase = Phase::Idle;
                         ui.level = 0.;
@@ -333,7 +353,12 @@ impl App {
                     } else if matches!(self.phase, Phase::Recording(_)) {
                         self.stop()
                     } else {
-                        self.start(true)
+                        let mode = if command == "start-formal" {
+                            DictationMode::Formal
+                        } else {
+                            DictationMode::Transcription
+                        };
+                        self.start_mode(true, mode)
                     }
                 }
                 "stop" => self.stop(),
@@ -365,10 +390,10 @@ impl App {
                     Err(e) => Err(e),
                 }
             }
-            Event::SaveServer(base_url) => self
-                .save_server(&base_url, settings::Settings::save)
+            Event::SaveServer(base_url, api_key) => self
+                .save_server(&base_url, api_key, settings::Settings::save)
                 .map(|()| {
-                    ui.server_saved(&self.settings.base_url);
+                    ui.server_saved(&self.settings.base_url, self.settings.api_key.as_deref());
                     self.request_catalog();
                 }),
             Event::SavePosition(x) => self.save_position(x, settings::Settings::save).map(|()| {
@@ -393,11 +418,19 @@ impl App {
                         || ui.monitors.iter().any(|m| m.name == settings.monitor),
                     "Selecciona una pantalla detectada"
                 );
-                if settings.shortcut != self.settings.shortcut {
-                    shortcut::apply(&settings.shortcut, &self.settings.shortcut)?;
+                if settings.shortcut != self.settings.shortcut
+                    || settings.shortcut_formal != self.settings.shortcut_formal
+                {
+                    shortcut::apply(
+                        &settings.shortcut,
+                        &settings.shortcut_formal,
+                        &self.settings.shortcut,
+                        &self.settings.shortcut_formal,
+                    )?;
                 }
                 let mut settings = settings;
                 settings.base_url = self.settings.base_url.clone();
+                settings.api_key = self.settings.api_key.clone();
                 settings.save()?;
                 self.settings = settings;
                 ui.settings_saved(&self.settings);
@@ -447,11 +480,11 @@ fn fetch_catalog(
     endpoint: &str,
     key: &str,
 ) -> Result<Vec<String>> {
-    let response = client
-        .get(endpoint)
-        .bearer_auth(key)
-        .send()?
-        .error_for_status()?;
+    let mut request = client.get(endpoint);
+    if !key.is_empty() {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send()?.error_for_status()?;
     let value: Value = response.json()?;
     let models = settings::routes(&value);
     ensure!(!models.is_empty(), "Catálogo de modelos vacío");
@@ -463,11 +496,14 @@ fn transcription_request(
     key: &str,
     body: &Value,
 ) -> reqwest::blocking::RequestBuilder {
-    client
+    let mut request = client
         .post(endpoint)
-        .bearer_auth(key)
         .json(body)
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(120));
+    if !key.is_empty() {
+        request = request.bearer_auth(key);
+    }
+    request
 }
 fn transcription_error(error: anyhow::Error) -> anyhow::Error {
     let timed_out = error.chain().any(|cause| {
@@ -557,15 +593,15 @@ fn main() -> Result<()> {
     let path = socket_path()?;
     if command != "run" {
         ensure!(
-            ["start", "stop", "toggle", "reload", "reset"].contains(&command.as_str()),
-            "Uso: hypr-dictate [run|start|stop|toggle|reload|reset]"
+            ["start", "start-formal", "stop", "toggle", "reload", "reset"]
+                .contains(&command.as_str()),
+            "Uso: hypr-dictate [run|start|start-formal|stop|toggle|reload|reset]"
         );
         let mut stream = UnixStream::connect(path).context("Inicia primero hypr-dictate run")?;
         stream.write_all(command.as_bytes())?;
         return Ok(());
     }
-    let key = std::env::var("CLIPROXYAPI_API_KEY").context("Falta CLIPROXYAPI_API_KEY")?;
-    ensure!(!key.is_empty(), "CLIPROXYAPI_API_KEY está vacía");
+    let key = std::env::var("CLIPROXYAPI_API_KEY").unwrap_or_default();
     let settings = settings::Settings::load()?;
     let (endpoint, _) = api_endpoints(Some(&settings.base_url))?;
     // Never unlink an existing path: it may belong to another live process.
@@ -595,6 +631,7 @@ fn main() -> Result<()> {
     });
     let mut app = App {
         phase: Phase::Idle,
+        mode: DictationMode::Transcription,
         capture: None,
         last_request_id: 0,
         catalog_generation: 0,
@@ -622,6 +659,7 @@ mod tests {
         let (tx, _) = mpsc::channel();
         App {
             phase,
+            mode: DictationMode::Transcription,
             capture: None,
             last_request_id: 2,
             catalog_generation: 0,
@@ -676,6 +714,112 @@ mod tests {
     }
 
     #[test]
+    fn stopped_recording_sends_the_captured_mode_prompt_and_saved_key() {
+        for mode in [DictationMode::Transcription, DictationMode::Formal] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!(
+                "http://{}/v1/chat/completions",
+                listener.local_addr().unwrap()
+            );
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                let mut byte = [0];
+                while !headers.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                assert!(
+                    headers
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case("authorization: Bearer saved-key"))
+                );
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    })
+                    .unwrap()
+                    .1
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).unwrap();
+                let response =
+                    r#"{"choices":[{"finish_reason":"stop","message":{"content":"Texto final"}}]}"#;
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+                serde_json::from_slice::<Value>(&body).unwrap()
+            });
+            let (tx, rx) = mpsc::channel();
+            let mut app = app(Phase::Recording("0xabc".into()));
+            app.tx = tx;
+            app.mode = mode;
+            app.endpoint = endpoint;
+            app.settings.api_key = Some("saved-key".into());
+            app.key = "environment-key".into();
+            app.settings.prompt = "Transcribe fielmente".into();
+            app.settings.prompt_formal = "Redacta profesionalmente".into();
+            app.capture = Some(Capture {
+                child: Command::new("sleep").arg("60").spawn().unwrap(),
+                reader: thread::spawn(|| Ok(vec![0; 3200])),
+                errors: thread::spawn(|| Ok(Vec::new())),
+            });
+            app.stop().unwrap();
+            let Event::Finished(id, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            else {
+                panic!("expected transcription result");
+            };
+            assert_eq!(id, 3);
+            assert_eq!(result.unwrap(), ("0xabc".into(), "Texto final".into()));
+            let body = server.join().unwrap();
+            assert_eq!(
+                body["messages"][0]["content"][0]["text"],
+                app.settings.prompt_for(mode)
+            );
+            assert_eq!(
+                body["messages"][0]["content"][1]["input_audio"]["format"],
+                "wav"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_uses_a_separate_prompt_without_replacing_dictation() {
+        let mut settings = settings::Settings {
+            prompt: "My dictation".into(),
+            prompt_formal: "My redaction".into(),
+            ..Default::default()
+        };
+        assert_eq!(settings.prompt_for(DictationMode::Formal), "My redaction");
+        assert_eq!(
+            settings.prompt_for(DictationMode::Transcription),
+            "My dictation"
+        );
+        assert_eq!(settings.mode(), DictationMode::Transcription);
+        settings.formal = true;
+        assert_eq!(settings.mode(), DictationMode::Formal);
+    }
+
+    #[test]
+    fn empty_key_does_not_send_an_authorization_header() {
+        let client = reqwest::blocking::Client::new();
+        let request = transcription_request(&client, "http://127.0.0.1", "", &json!({}))
+            .build()
+            .unwrap();
+        assert!(
+            !request
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION)
+        );
+    }
+
+    #[test]
     fn saving_server_works_without_catalog_and_preserves_other_settings() {
         let mut app = app(Phase::Idle);
         app.settings.model = "saved/model".into();
@@ -683,7 +827,7 @@ mod tests {
         let mut expected = app.settings.clone();
         expected.base_url = "https://proxy.example/service".into();
         let mut calls = 0;
-        app.save_server(&expected.base_url, |candidate| {
+        app.save_server(&expected.base_url, None, |candidate| {
             calls += 1;
             assert_eq!(format!("{candidate:?}"), format!("{expected:?}"));
             Ok(())
@@ -703,7 +847,7 @@ mod tests {
             let mut app = app(phase);
             let original = format!("{:?}", app.settings);
             let error = app
-                .save_server("http://127.0.0.1:9000", |_| {
+                .save_server("http://127.0.0.1:9000", None, |_| {
                     panic!("must not persist server during dictation")
                 })
                 .unwrap_err();
@@ -712,12 +856,45 @@ mod tests {
         }
         let mut app = app(Phase::Idle);
         let original = format!("{:?}", app.settings);
-        app.save_server("http://127.0.0.1:9000", |_| bail!("disk full"))
+        app.save_server("http://127.0.0.1:9000", None, |_| bail!("disk full"))
             .unwrap_err();
         assert_eq!(format!("{:?}", app.settings), original);
         assert!(app.endpoint.is_empty());
-        app.save_server("ftp://invalid", |_| panic!("invalid URL must not persist"))
+        app.save_server("ftp://invalid", None, |_| {
+            panic!("invalid URL must not persist")
+        })
+        .unwrap_err();
+    }
+
+    #[test]
+    fn key_save_is_atomic_and_invalidates_old_catalogues_even_on_the_same_server() {
+        let mut app = app(Phase::Idle);
+        app.key = "environment".into();
+        app.settings.api_key = Some("old".into());
+        app.catalog_generation = 4;
+        let base = app.settings.base_url.clone();
+        app.save_server(&base, Some("new".into()), |_| bail!("disk full"))
             .unwrap_err();
+        assert_eq!(app.settings.effective_key(&app.key), "old");
+        app.save_server(&base, Some("new".into()), |candidate| {
+            assert_eq!(candidate.api_key.as_deref(), Some("new"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(app.settings.effective_key(&app.key), "new");
+        // Endpoint validation fails locally; generation changes must not require a live server.
+        app.settings.base_url = "ftp://invalid".into();
+        let base = app.settings.base_url.clone();
+        app.request_catalog();
+        assert!(!app.catalog_is_current(&base, 4));
+        assert!(app.catalog_is_current(&base, 5));
+        let error = app
+            .save_server(settings::DEFAULT_BASE_URL, Some("bad\r\nkey".into()), |_| {
+                panic!("invalid key must not persist")
+            })
+            .unwrap_err();
+        assert!(!error.to_string().contains("bad"));
+        assert_eq!(app.settings.effective_key(&app.key), "new");
     }
 
     #[test]
@@ -775,6 +952,12 @@ mod tests {
                     .map(|(_, value)| value.trim().parse::<usize>().unwrap())
                     .unwrap_or(0);
                 socket.read_exact(&mut vec![0; length]).unwrap();
+                assert!(
+                    request
+                        .lines()
+                        .any(|line| line
+                            .eq_ignore_ascii_case("authorization: Bearer saved-test-key"))
+                );
                 requests.push(request.lines().next().unwrap().to_owned());
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
@@ -790,6 +973,8 @@ mod tests {
         app.client = client.clone();
         app.tx = tx;
         app.settings.base_url = base.clone();
+        app.key = "environment-test-key".into();
+        app.settings.api_key = Some("saved-test-key".into());
         app.request_catalog();
         let Event::Catalog(reply_base, generation, models) =
             rx.recv_timeout(Duration::from_secs(3)).unwrap()
@@ -803,7 +988,7 @@ mod tests {
         let body = send_transcription(transcription_request(
             &client,
             &transcription,
-            "test",
+            &app.settings.effective_key(&app.key),
             &json!({}),
         ))
         .unwrap();
@@ -1081,6 +1266,7 @@ mod tests {
                 monitor: "saved-monitor".into(),
                 temperature: 0.7,
                 prompt: "saved prompt".into(),
+                ..settings::Settings::default()
             };
             let mut expected = app.settings.clone();
             expected.x = 456;

@@ -198,12 +198,14 @@ impl Ui {
         self.saved = settings.clone();
         self.draft = settings.clone();
     }
-    pub fn server_saved(&mut self, base_url: &str) {
+    pub fn server_saved(&mut self, base_url: &str, api_key: Option<&str>) {
         self.saved.base_url = base_url.into();
         self.draft.base_url = base_url.into();
+        self.saved.api_key = api_key.map(str::to_owned);
+        self.draft.api_key = api_key.map(str::to_owned);
         self.models.clear();
         if let Some(preferences) = &self.preferences {
-            preferences.server_saved(base_url);
+            preferences.server_saved(base_url, api_key);
         }
         self.message = "Servidor guardado · cargando catálogo…".into();
         self.dirty = true;
@@ -781,6 +783,21 @@ mod tests {
     }
 
     #[test]
+    fn both_shortcut_commands_validate_models_and_cannot_switch_an_active_mode() {
+        for command in ["start", "start-formal"] {
+            let (mut ui, _server) = ui();
+            let mut app = crate::tests::app(hypr_dictate::Phase::Idle);
+            app.event(Event::Command(command.into()), &mut ui);
+            assert_eq!(app.phase, hypr_dictate::Phase::Error);
+            assert!(app.error.contains("Selecciona y guarda un modelo"));
+            app.phase = hypr_dictate::Phase::Recording("0xabc".into());
+            app.mode = hypr_dictate::DictationMode::Formal;
+            app.event(Event::Command(command.into()), &mut ui);
+            assert_eq!(app.mode, hypr_dictate::DictationMode::Formal);
+        }
+    }
+
+    #[test]
     fn shared_files_are_memory_backed_and_close_on_exec() {
         use std::os::fd::AsRawFd;
         let file = memory_file().unwrap();
@@ -891,7 +908,7 @@ mod tests {
         ui.settings_saved(&settings);
         assert!(ui.dock_reconfigure);
         assert_eq!(ui.saved.monitor, "other");
-        ui.server_saved("https://new.example");
+        ui.server_saved("https://new.example", None);
         assert_eq!(ui.saved.monitor, "other");
         assert_eq!(ui.saved.base_url, "https://new.example");
         assert!(ui.models.is_empty());

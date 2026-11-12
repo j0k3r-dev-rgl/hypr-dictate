@@ -1,3 +1,10 @@
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum DictationMode {
+    #[default]
+    Transcription,
+    Formal,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Phase {
     Idle,

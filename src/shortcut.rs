@@ -2,40 +2,46 @@ use crate::{hypr, settings::binding_block};
 use anyhow::{Context, Result, ensure};
 use std::io::Write;
 
-pub fn apply(shortcut: &str, old: &str) -> Result<()> {
+pub fn apply(shortcut: &str, formal: &str, old: &str, old_formal: &str) -> Result<()> {
     ensure!(
-        shortcut.is_empty()
-            || shortcut
-                .split('+')
-                .next_back()
-                .is_some_and(|s| !s.trim().is_empty()),
-        "Atajo vacío"
+        shortcut.is_empty() || shortcut != formal,
+        "Los dos modos necesitan atajos distintos"
     );
     let binds: serde_json::Value = serde_json::from_slice(&hypr(&["-j", "binds"])?)?;
-    if !shortcut.is_empty() && shortcut != old {
-        let parts: Vec<_> = shortcut.split('+').map(str::trim).collect();
-        let key = parts.last().unwrap();
-        let mut mask = 0;
-        for modifier in &parts[..parts.len() - 1] {
-            mask |= match *modifier {
-                "SUPER" => 64,
-                "CTRL" => 4,
-                "ALT" => 8,
-                "SHIFT" => 1,
-                _ => anyhow::bail!("Modificador inválido"),
-            };
-        }
+    for shortcut in [shortcut, formal] {
         ensure!(
-            !binds
-                .as_array()
-                .context("Lista de atajos inválida")?
-                .iter()
-                .any(|b| b["modmask"].as_i64() == Some(mask)
-                    && b["key"]
-                        .as_str()
-                        .is_some_and(|k| k.eq_ignore_ascii_case(key))),
-            "Ese atajo ya está ocupado en Hyprland"
+            shortcut.is_empty()
+                || shortcut
+                    .split('+')
+                    .next_back()
+                    .is_some_and(|s| !s.trim().is_empty()),
+            "Atajo vacío"
         );
+        if !shortcut.is_empty() && shortcut != old && shortcut != old_formal {
+            let parts: Vec<_> = shortcut.split('+').map(str::trim).collect();
+            let key = parts.last().unwrap();
+            let mut mask = 0;
+            for modifier in &parts[..parts.len() - 1] {
+                mask |= match *modifier {
+                    "SUPER" => 64,
+                    "CTRL" => 4,
+                    "ALT" => 8,
+                    "SHIFT" => 1,
+                    _ => anyhow::bail!("Modificador inválido"),
+                };
+            }
+            ensure!(
+                !binds
+                    .as_array()
+                    .context("Lista de atajos inválida")?
+                    .iter()
+                    .any(|b| b["modmask"].as_i64() == Some(mask)
+                        && b["key"]
+                            .as_str()
+                            .is_some_and(|k| k.eq_ignore_ascii_case(key))),
+                "Ese atajo ya está ocupado en Hyprland"
+            );
+        }
     }
     let path = std::path::PathBuf::from(std::env::var_os("HOME").context("Falta HOME")?)
         .join(".config/hypr/keybinds.lua");
@@ -47,7 +53,12 @@ pub fn apply(shortcut: &str, old: &str) -> Result<()> {
     }
     let original = std::fs::read_to_string(&path)?;
     let exe = std::env::current_exe()?;
-    let updated = binding_block(&original, shortcut, exe.to_str().context("Ruta no UTF-8")?)?;
+    let updated = binding_block(
+        &original,
+        shortcut,
+        formal,
+        exe.to_str().context("Ruta no UTF-8")?,
+    )?;
     let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
     temporary
         .as_file()

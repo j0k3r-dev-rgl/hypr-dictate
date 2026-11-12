@@ -64,8 +64,9 @@ impl Draft {
             self.settings.model = model.into();
         }
     }
-    fn server_saved(&mut self, url: &str) {
+    fn server_saved(&mut self, url: &str, api_key: Option<&str>) {
         self.settings.base_url = url.into();
+        self.settings.api_key = api_key.map(str::to_owned);
         self.models.clear();
     }
 }
@@ -84,11 +85,16 @@ struct Widgets {
     account: gtk::DropDown,
     model: gtk::DropDown,
     shortcut: gtk::DropDown,
+    shortcut_formal: gtk::DropDown,
+    formal: gtk::CheckButton,
     microphone: gtk::DropDown,
     monitor: gtk::DropDown,
     temperature: gtk::SpinButton,
     prompt: gtk::TextView,
+    prompt_formal: gtk::TextView,
     url: gtk::Entry,
+    api_key: gtk::PasswordEntry,
+    use_environment: gtk::CheckButton,
     status: gtk::Label,
     data: RefCell<Draft>,
     updating: Cell<bool>,
@@ -166,6 +172,16 @@ impl Preferences {
             SHORTCUTS[4],
             SHORTCUTS[5],
         ]);
+        let shortcut_formal = gtk::DropDown::from_strings(&[
+            "Sin atajo",
+            SHORTCUTS[1],
+            SHORTCUTS[2],
+            SHORTCUTS[3],
+            SHORTCUTS[4],
+            SHORTCUTS[5],
+        ]);
+        let formal = gtk::CheckButton::with_label("Redacción profesional al usar el dock");
+        formal.set_tooltip_text(Some("Reformula tu dictado con claridad y tono profesional, sin inventar datos ni leer otras aplicaciones."));
         let microphone = dropdown();
         let monitor = dropdown();
         row(
@@ -189,6 +205,14 @@ impl Preferences {
             "Mantén pulsado para hablar y suelta para transcribir.",
             &shortcut,
         );
+        row(
+            &general,
+            "input-keyboard-symbolic",
+            "Atajo de redacción profesional",
+            "Mantén pulsado para redactar. Debe ser distinto al atajo de dictado.",
+            &shortcut_formal,
+        );
+        general.append(&formal);
         row(
             &general,
             "audio-input-microphone-symbolic",
@@ -243,6 +267,31 @@ impl Preferences {
             .has_frame(true)
             .build();
         ai.append(&scroll);
+        let formal_label = gtk::Label::new(Some("Prompt de redacción profesional"));
+        formal_label.set_xalign(0.);
+        formal_label.add_css_class("heading");
+        ai.append(&formal_label);
+        let prompt_formal = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .monospace(true)
+            .left_margin(12)
+            .right_margin(12)
+            .top_margin(12)
+            .bottom_margin(12)
+            .accepts_tab(false)
+            .vexpand(true)
+            .build();
+        prompt_formal.buffer().set_enable_undo(true);
+        formal_label.set_mnemonic_widget(Some(&prompt_formal));
+        ai.append(
+            &gtk::ScrolledWindow::builder()
+                .child(&prompt_formal)
+                .vexpand(true)
+                .min_content_height(180)
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .has_frame(true)
+                .build(),
+        );
         let restore = button(
             "edit-undo-symbolic",
             "Restaurar valores",
@@ -250,7 +299,11 @@ impl Preferences {
         );
         restore.set_halign(gtk::Align::Start);
         ai.append(&restore);
-        stack.add_titled(&ai, Some("ai"), "Prompt e IA");
+        let ai_scroll = gtk::ScrolledWindow::builder()
+            .child(&ai)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        stack.add_titled(&ai_scroll, Some("ai"), "Prompts e IA");
 
         let server = page();
         let url = gtk::Entry::builder()
@@ -265,21 +318,41 @@ impl Preferences {
             "HTTP o HTTPS, sin /v1, credenciales, parámetros ni fragmentos.",
             &url,
         );
+        let api_key = gtk::PasswordEntry::builder()
+            .hexpand(true)
+            .show_peek_icon(true)
+            .build();
+        row(
+            &server,
+            "dialog-password-symbolic",
+            "API key",
+            "Se guarda en texto plano en settings.json con permisos 0600. Vacía permite usar un servidor sin autenticación.",
+            &api_key,
+        );
+        let use_environment =
+            gtk::CheckButton::with_label("Usar CLIPROXYAPI_API_KEY (si está definida)");
+        server.append(&use_environment);
+        let weak_key = api_key.downgrade();
+        use_environment.connect_toggled(move |field| {
+            if let Some(key) = weak_key.upgrade() {
+                key.set_sensitive(!field.is_active());
+            }
+        });
         let save_server = button(
             "network-server-symbolic",
-            "Guardar servidor",
-            "Guarda solo la URL y recarga el catálogo, incluso si el servidor anterior no responde.",
+            "Guardar servidor y API key",
+            "Guarda solo la URL y la clave y recarga el catálogo, incluso si el servidor anterior no responde.",
         );
         save_server.set_halign(gtk::Align::Start);
         server.append(&save_server);
         let help = gtk::Label::new(Some(
-            "Guardar servidor no aplica los demás cambios pendientes.\nDespués, elige un modelo compatible en General.\nLa clave se obtiene de CLIPROXYAPI_API_KEY; no se guarda aquí.",
+            "Guardar servidor y API key no aplica los demás cambios pendientes.\nLa clave guardada queda en texto plano con permisos solo para tu usuario.\nDespués, elige un modelo compatible en General.",
         ));
         help.set_wrap(true);
         help.set_xalign(0.);
         help.add_css_class("dim-label");
         server.append(&help);
-        stack.add_titled(&server, Some("server"), "Servidor");
+        stack.add_titled(&server, Some("server"), "Servidor y API key");
 
         let status = gtk::Label::builder()
             .wrap(true)
@@ -324,11 +397,16 @@ impl Preferences {
             account,
             model,
             shortcut,
+            shortcut_formal,
+            formal,
             microphone,
             monitor,
             temperature,
             prompt,
+            prompt_formal,
             url,
+            api_key,
+            use_environment,
             status,
             data: RefCell::new(Draft::new(settings, models)),
             updating: Cell::new(false),
@@ -376,7 +454,12 @@ impl Preferences {
         let weak = Rc::downgrade(&widgets);
         save_server.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                let _ = w.tx.send(Event::SaveServer(w.url.text().into()));
+                let key = if w.use_environment.is_active() {
+                    None
+                } else {
+                    Some(w.api_key.text().into())
+                };
+                let _ = w.tx.send(Event::SaveServer(w.url.text().into(), key));
             }
         });
         let weak = Rc::downgrade(&widgets);
@@ -389,6 +472,9 @@ impl Preferences {
         restore.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
                 w.prompt.buffer().set_text(settings::DEFAULT_PROMPT);
+                w.prompt_formal
+                    .buffer()
+                    .set_text(settings::DEFAULT_PROMPT_FORMAL);
                 w.temperature.set_value(settings::DEFAULT_TEMPERATURE);
                 w.status.set_text(
                     "Valores restaurados en el borrador; pulsa Guardar cambios para aplicarlos.",
@@ -415,9 +501,11 @@ impl Preferences {
         self.0.data.borrow_mut().models = models.to_vec();
         self.0.rebuild_accounts();
     }
-    pub fn server_saved(&self, base_url: &str) {
-        self.0.data.borrow_mut().server_saved(base_url);
+    pub fn server_saved(&self, base_url: &str, api_key: Option<&str>) {
+        self.0.data.borrow_mut().server_saved(base_url, api_key);
         self.0.url.set_text(base_url);
+        self.0.api_key.set_text(api_key.unwrap_or(""));
+        self.0.use_environment.set_active(api_key.is_none());
         self.0.rebuild_accounts();
     }
     pub fn position_saved(&self, x: i32) {
@@ -428,6 +516,21 @@ impl Widgets {
     fn load(&self) {
         let data = self.data.borrow();
         self.url.set_text(&data.settings.base_url);
+        self.api_key
+            .set_text(data.settings.api_key.as_deref().unwrap_or(""));
+        self.use_environment
+            .set_active(data.settings.api_key.is_none());
+        self.api_key.set_sensitive(data.settings.api_key.is_some());
+        self.formal.set_active(data.settings.formal);
+        self.prompt_formal
+            .buffer()
+            .set_text(&data.settings.prompt_formal);
+        self.shortcut_formal.set_selected(
+            SHORTCUTS
+                .iter()
+                .position(|s| *s == data.settings.shortcut_formal)
+                .map_or(gtk::INVALID_LIST_POSITION, |i| i as u32),
+        );
         self.temperature.set_value(data.settings.temperature);
         self.prompt.buffer().set_text(&data.settings.prompt);
         self.shortcut.set_selected(
@@ -511,6 +614,15 @@ impl Widgets {
             .checked_sub(1)
             .and_then(|i| self.monitors.get(i as usize))
             .map_or(String::new(), |m| m.name.clone());
+        settings.formal = self.formal.is_active();
+        settings.shortcut_formal = SHORTCUTS
+            .get(self.shortcut_formal.selected() as usize)
+            .unwrap_or(&"")
+            .to_string();
+        let buffer = self.prompt_formal.buffer();
+        settings.prompt_formal = buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), true)
+            .into();
         settings.temperature = self.temperature.value();
         let buffer = self.prompt.buffer();
         settings.prompt = buffer
@@ -572,6 +684,15 @@ mod tests {
         w.account.set_selected(1);
         assert_eq!(w.model.selected(), 0);
         w.model.set_selected(1);
+        assert!(w.api_key.shows_peek_icon());
+        assert!(w.use_environment.is_active());
+        assert!(!w.api_key.is_sensitive());
+        w.use_environment.set_active(false);
+        assert!(w.api_key.is_sensitive());
+        w.api_key.set_text("draft-secret");
+        w.formal.set_active(true);
+        w.shortcut_formal.set_selected(5);
+        w.prompt_formal.buffer().set_text("Redacta este mensaje.");
         w.prompt.buffer().set_text("áñ🙂\nsecond line");
         assert!(w.prompt.buffer().enables_undo());
         let buffer = w.prompt.buffer();
@@ -583,6 +704,13 @@ mod tests {
         assert_eq!(snapshot.model, "account/audio");
         assert_eq!(snapshot.prompt, "áñ🙂\nsecond line");
         assert_eq!(snapshot.base_url, settings::DEFAULT_BASE_URL);
+        assert!(
+            snapshot.api_key.is_none(),
+            "general save must not commit the key draft"
+        );
+        assert!(snapshot.formal);
+        assert_eq!(snapshot.shortcut_formal, "SUPER + F10");
+        assert_eq!(snapshot.prompt_formal, "Redacta este mensaje.");
         fn click(widget: &gtk::Widget, title: &str) -> bool {
             if let Some(button) = widget.downcast_ref::<gtk::Button>()
                 && let Some(content) = button.child()
@@ -607,11 +735,14 @@ mod tests {
         assert!(
             matches!(rx.try_recv().unwrap(), Event::Save(settings) if settings.prompt == snapshot.prompt && settings.base_url == settings::DEFAULT_BASE_URL)
         );
-        assert!(click(w.window.upcast_ref(), "Guardar servidor"));
+        assert!(click(w.window.upcast_ref(), "Guardar servidor y API key"));
         assert!(
-            matches!(rx.try_recv().unwrap(), Event::SaveServer(url) if url == "https://new.example")
+            matches!(rx.try_recv().unwrap(), Event::SaveServer(url, Some(key)) if url == "https://new.example" && key == "draft-secret")
         );
-        preferences.server_saved("https://new.example");
+        preferences.server_saved("https://new.example", Some("draft-secret"));
+        assert_eq!(w.snapshot().api_key.as_deref(), Some("draft-secret"));
+        assert!(w.snapshot().formal);
+        assert_eq!(w.snapshot().prompt_formal, "Redacta este mensaje.");
         assert_eq!(w.snapshot().prompt, snapshot.prompt);
         assert_eq!(w.snapshot().base_url, "https://new.example");
         preferences.catalog_loaded(&models);
@@ -638,6 +769,10 @@ mod tests {
         assert!(rx.try_recv().is_err());
         let reopened = Preferences::new(&saved, &models, &[], &[], "test", tx).unwrap();
         assert_eq!(reopened.0.snapshot().prompt, saved.prompt);
+        assert!(!reopened.0.snapshot().formal);
+        assert_eq!(reopened.0.snapshot().prompt_formal, saved.prompt_formal);
+        assert!(reopened.0.api_key.text().is_empty());
+        assert!(reopened.0.use_environment.is_active());
         reopened.close();
     }
 
@@ -667,7 +802,7 @@ mod tests {
         let mut draft = Draft::new(&saved, &["account/audio".into()]);
         assert_eq!(selected(&draft.available(), &draft.settings.model), 0);
         draft.settings.prompt = "pending".into();
-        draft.server_saved("https://new.example");
+        draft.server_saved("https://new.example", None);
         assert_eq!(draft.settings.prompt, "pending");
         assert_eq!(draft.settings.model, "account/audio");
         assert!(draft.models.is_empty());
